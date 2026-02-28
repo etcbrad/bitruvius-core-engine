@@ -1,0 +1,3001 @@
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { motion, AnimatePresence } from 'motion/react';
+import { 
+  Activity, 
+  Lock, 
+  Unlock, 
+  RotateCcw, 
+  RotateCw,
+  Maximize2, 
+  Move, 
+  Download,
+  Upload,
+  Anchor,
+  Layers,
+  Settings2,
+  ChevronRight,
+  ChevronLeft,
+  Trash2,
+  Terminal,
+  Minus,
+  X
+} from 'lucide-react';
+import { Joint, Point, SkeletonState, ControlMode, Connection } from './types';
+import { viewModes, ViewModeId } from './viewModes';
+import { throttle, normA, d2r, r2d, clamp } from './utils';
+import { applyBalanceDragToState, applyDragToState } from './engine/interaction';
+import { fromAngleDeg, getWorldPosition, getWorldPositionFromOffsets, toAngleDeg, vectorLength } from './engine/kinematics';
+import { HistoryController } from './engine/history';
+import { deserializeEngineState, serializeEngineState } from './engine/serialization';
+import { downloadSvg } from './engine/export/svg';
+import { downloadPngFromSvg } from './engine/export/png';
+import { exportAsWebm } from './engine/export/video';
+import { applyPoseSnapshotToJoints, capturePoseSnapshot, sampleClipPose } from './engine/timeline';
+import { getGhostFrames } from './engine/onionSkin';
+import { makeDefaultState, sanitizeState, sanitizeJoints } from './engine/settings';
+import { INITIAL_JOINTS } from './engine/model';
+
+const LOCAL_STORAGE_KEY = 'bitruvius_state';
+const BUILD_ID = 'joint-masks-drag-2026-02-28';
+const DND_WIDGET_MIME = 'text/bitruvius-widget';
+
+type WidgetKind = 'joint_masks' | 'console';
+
+type FloatingWidget = {
+  id: string;
+  kind: WidgetKind;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  minimized: boolean;
+};
+
+type ConsoleLogLevel = 'info' | 'warning' | 'error' | 'success';
+
+type ConsoleLogEntry = {
+  id: string;
+  ts: number;
+  level: ConsoleLogLevel;
+  message: string;
+  data?: unknown;
+};
+
+type GridRingsBackgroundData = {
+  schema: string;
+  vitruvian: {
+    plot: {
+      bounds: { minX: number; maxX: number; minY: number; maxY: number };
+      lines: Array<{ kind: 'line'; family: string; key: string; x1: number; y1: number; x2: number; y2: number }>;
+      circles: Array<{ kind: 'circle'; family: string; key: string; cx: number; cy: number; r: number }>;
+    };
+  };
+  background?: {
+    defaultMode?: { kind: 'solid'; fillStyle: string };
+    lotteMode?: { kind: string };
+  };
+};
+
+type GridOverlayTransform = {
+  characterCenterX: number;
+  characterCenterY: number;
+  pxPerUnit: number;
+  headLenPx: number;
+  fingerLenPx: number;
+  vmin: number;
+};
+
+const CONNECTIONS: Connection[] = [
+  { from: "neck_base", to: "l_shoulder", type: "bone", label: "L_Clavicle", shape: 'cylinder' },
+  { from: "neck_base", to: "r_shoulder", type: "bone", label: "R_Clavicle", shape: 'cylinder' },
+  { from: "l_shoulder", to: "l_elbow", type: "bone", label: "L_Humerus", shape: 'muscle' },
+  { from: "r_shoulder", to: "r_elbow", type: "bone", label: "R_Humerus", shape: 'muscle' },
+  { from: "l_elbow", to: "l_wrist", type: "bone", label: "L_Radius_Ulna", shape: 'tapered' },
+  { from: "r_elbow", to: "r_wrist", type: "bone", label: "R_Radius_Ulna", shape: 'tapered' },
+  { from: "l_wrist", to: "l_fingertip", type: "soft_limit", label: "L_Hand", shape: 'wire' },
+  { from: "r_wrist", to: "r_fingertip", type: "soft_limit", label: "R_Hand", shape: 'wire' },
+  { from: "l_elbow", to: "l_nipple", type: "structural_link", shape: 'wire' },
+  { from: "r_elbow", to: "r_nipple", type: "structural_link", shape: 'wire' },
+  { from: "l_nipple", to: "navel", type: "structural_link", shape: 'wire' },
+  { from: "r_nipple", to: "navel", type: "structural_link", shape: 'wire' },
+  { from: "navel", to: "l_hip", type: "structural_link", shape: 'wire' },
+  { from: "navel", to: "r_hip", type: "structural_link", shape: 'wire' },
+  { from: "sacrum", to: "l_hip", type: "bone", label: "L_Pelvis", shape: 'cylinder' },
+  { from: "sacrum", to: "r_hip", type: "bone", label: "R_Pelvis", shape: 'cylinder' },
+  { from: "l_hip", to: "l_knee", type: "bone", label: "L_Femur", shape: 'muscle' },
+  { from: "r_hip", to: "r_knee", type: "bone", label: "R_Femur", shape: 'muscle' },
+  { from: "l_knee", to: "l_ankle", type: "bone", label: "L_Tibia", shape: 'tapered' },
+  { from: "r_knee", to: "r_ankle", type: "bone", label: "R_Tibia", shape: 'tapered' },
+  { from: "l_knee", to: "sacrum", type: "structural_link", shape: 'wire' },
+  { from: "r_knee", to: "sacrum", type: "structural_link", shape: 'wire' },
+  // Core spine connections not in user list but needed for visual
+  { from: "sacrum", to: "navel", type: "bone", label: "Lower Spine", shape: 'cylinder' },
+  { from: "navel", to: "sternum", type: "bone", label: "Upper Spine", shape: 'cylinder' },
+  { from: "sternum", to: "neck_base", type: "bone", label: "Neck", shape: 'cylinder' },
+  { from: "neck_base", to: "head", type: "bone", label: "Skull", shape: 'standard' },
+];
+
+export default function App() {
+  const [state, setState] = useState<SkeletonState>(() => {
+    const saved = localStorage.getItem(LOCAL_STORAGE_KEY);
+    if (saved) {
+      const parsed = deserializeEngineState(saved);
+      if (parsed.ok) {
+        return sanitizeState(parsed.rawState);
+      }
+    }
+    return makeDefaultState();
+  });
+
+  useEffect(() => {
+    console.log(`[bitruvius] build=${BUILD_ID}`);
+  }, []);
+
+  const historyCtrlRef = useRef(new HistoryController<SkeletonState>({ limit: 120 }));
+  const canUndo = historyCtrlRef.current.canUndo();
+  const canRedo = historyCtrlRef.current.canRedo();
+
+  type PoseSnapshot = Omit<SkeletonState, 'timeline'>;
+  const [poseSnapshots, setPoseSnapshots] = useState<PoseSnapshot[]>([]);
+
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const draggingIdLiveRef = useRef<string | null>(null);
+  const pinWorldRef = useRef<Record<string, Point> | null>(null);
+  const [maskEditArmed, setMaskEditArmed] = useState(false);
+  const [maskDragging, setMaskDragging] = useState<null | {
+    jointId: string;
+    startClientX: number;
+    startClientY: number;
+    startOffsetX: number;
+    startOffsetY: number;
+  }>(null);
+  const maskDraggingLiveRef = useRef(false);
+  const [maskJointId, setMaskJointId] = useState<string>('head');
+  const [selectedJointId, setSelectedJointId] = useState<string | null>(null);
+  const [timelineFrame, setTimelineFrame] = useState(0);
+  const timelineFrameRef = useRef(0);
+  const [timelinePlaying, setTimelinePlaying] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const canvasRef = useRef<HTMLDivElement>(null);
+  const svgRef = useRef<SVGSVGElement>(null);
+  const importStateInputRef = useRef<HTMLInputElement>(null);
+  const maskUploadInputRef = useRef<HTMLInputElement>(null);
+  const jointMaskUploadInputRef = useRef<HTMLInputElement>(null);
+  const maskJointIdRef = useRef<string>('head');
+  const [canvasSize, setCanvasSize] = useState({ width: 0, height: 0 });
+  const [gridRingsBgData, setGridRingsBgData] = useState<GridRingsBackgroundData | null>(null);
+  const [gridRingsEnabled, setGridRingsEnabled] = useState(true);
+  const [gridOverlayTransform, setGridOverlayTransform] = useState<GridOverlayTransform | null>(null);
+  const gridRingsBg = gridRingsEnabled ? gridRingsBgData : null;
+
+  const [floatingWidgets, setFloatingWidgets] = useState<FloatingWidget[]>([]);
+  const [widgetDragging, setWidgetDragging] = useState<null | {
+    id: string;
+    startClientX: number;
+    startClientY: number;
+    startX: number;
+    startY: number;
+  }>(null);
+
+  const [consoleOpen, setConsoleOpen] = useState(false);
+  const [consoleMinimized, setConsoleMinimized] = useState(false);
+  const [consoleLogs, setConsoleLogs] = useState<ConsoleLogEntry[]>([]);
+  const [activeLogLevels, setActiveLogLevels] = useState<Set<ConsoleLogLevel>>(
+    () => new Set(['info', 'warning', 'error', 'success']),
+  );
+
+  const addConsoleLog = useCallback((level: ConsoleLogLevel, message: string, data?: unknown) => {
+    const id = Math.random().toString(36).slice(2, 10);
+    setConsoleLogs((prev) => [
+      ...prev.slice(-199),
+      {
+        id,
+        ts: Date.now(),
+        level,
+        message,
+        data,
+      },
+    ]);
+  }, []);
+
+  const filteredConsoleLogs = consoleLogs.filter((log) => activeLogLevels.has(log.level));
+
+  const spawnFloatingWidget = useCallback(
+    (kind: WidgetKind, clientX: number, clientY: number) => {
+      const rect = canvasRef.current?.getBoundingClientRect();
+      const x = rect ? clientX - rect.left : clientX;
+      const y = rect ? clientY - rect.top : clientY;
+
+      const w = kind === 'console' ? 420 : 360;
+      const h = kind === 'console' ? 280 : 420;
+      const id = kind + '-' + Math.random().toString(36).slice(2, 9);
+
+      setFloatingWidgets((prev) => [
+        ...prev,
+        {
+          id,
+          kind,
+          minimized: false,
+          w,
+          h,
+          x: Math.max(12, Math.round(x - w * 0.5)),
+          y: Math.max(12, Math.round(y - 18)),
+        },
+      ]);
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (!widgetDragging) return;
+
+    const onMove = (e: MouseEvent) => {
+      const dx = e.clientX - widgetDragging.startClientX;
+      const dy = e.clientY - widgetDragging.startClientY;
+      setFloatingWidgets((prev) =>
+        prev.map((w) =>
+          w.id === widgetDragging.id
+            ? {
+                ...w,
+                x: widgetDragging.startX + dx,
+                y: widgetDragging.startY + dy,
+              }
+            : w,
+        ),
+      );
+    };
+
+    const onUp = () => setWidgetDragging(null);
+
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, [widgetDragging]);
+
+  const setStateWithHistory = useCallback(
+    (actionId: string, update: (prev: SkeletonState) => SkeletonState) => {
+      setState((prev) => {
+        const next = update(prev);
+        if (!Object.is(next, prev)) {
+          historyCtrlRef.current.pushUndo(actionId, prev);
+        }
+        return next;
+      });
+    },
+    [],
+  );
+
+  const downloadStateJson = useCallback(() => {
+    const json = serializeEngineState(state, { pretty: true });
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
+    const filename = `bitruvius-state-${timestamp}.json`;
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    link.style.display = 'none';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    addConsoleLog('success', `State exported: ${filename}`);
+  }, [addConsoleLog, state]);
+
+  const importStateFile = useCallback(
+    async (file: File) => {
+      try {
+        const text = await file.text();
+        const parsed = deserializeEngineState(text);
+        if (parsed.ok === false) {
+          alert(`Import failed: ${parsed.error}`);
+          return;
+        }
+        const next = sanitizeState(parsed.rawState);
+        setStateWithHistory('import_state', () => next);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Unknown error';
+        alert(`Import failed: ${message}`);
+      }
+    },
+    [setStateWithHistory],
+  );
+
+  const exportSvg = useCallback(() => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    if (!canvasSize.width || !canvasSize.height) return;
+    downloadSvg(svg, {
+      width: canvasSize.width,
+      height: canvasSize.height,
+      backgroundColor: gridRingsBg ? 'rgba(248, 248, 252, 0.94)' : '#0a0a0a',
+    });
+  }, [canvasSize.height, canvasSize.width, gridRingsBg]);
+
+  const exportPng = useCallback(async () => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    if (!canvasSize.width || !canvasSize.height) return;
+    try {
+      await downloadPngFromSvg(svg, {
+        width: canvasSize.width,
+        height: canvasSize.height,
+        backgroundColor: gridRingsBg ? 'rgba(248, 248, 252, 0.94)' : '#0a0a0a',
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Unknown error';
+      alert(`Export failed: ${message}`);
+    }
+  }, [canvasSize.height, canvasSize.width, gridRingsBg]);
+
+  const exportVideo = useCallback(async () => {
+    if (!canvasSize.width || !canvasSize.height) return;
+    if (!state.timeline.enabled) {
+      alert('Timeline must be enabled to export video');
+      return;
+    }
+
+    try {
+      setTimelinePlaying(false);
+      await exportAsWebm({
+        width: canvasSize.width,
+        height: canvasSize.height,
+        backgroundColor: gridRingsBg ? 'rgba(248, 248, 252, 0.94)' : '#0a0a0a',
+        fps: state.timeline.clip.fps,
+        scale: 1,
+        timeline: state.timeline,
+        baseJoints: INITIAL_JOINTS,
+        connections: CONNECTIONS,
+        scene: state.scene,
+        activePins: state.activePins,
+        stretchEnabled: state.stretchEnabled,
+        fallbackPose: capturePoseSnapshot(state.joints, 'preview'),
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Unknown error';
+      alert(`Video export failed: ${message}`);
+    }
+  }, [
+    canvasSize.height,
+    canvasSize.width,
+    gridRingsBg,
+    state.activePins,
+    state.scene,
+    state.stretchEnabled,
+    state.timeline,
+    state.joints,
+  ]);
+
+  const uploadMaskFile = useCallback(
+    async (file: File) => {
+      try {
+        const url = URL.createObjectURL(file);
+        setStateWithHistory('upload_mask', (prev) => ({
+          ...prev,
+          scene: {
+            ...prev.scene,
+            headMask: {
+              ...prev.scene.headMask,
+              src: url,
+              visible: true,
+            },
+          },
+        }));
+        addConsoleLog('success', `Mask uploaded: ${file.name}`);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Unknown error';
+        alert(`Mask upload failed: ${message}`);
+        addConsoleLog('error', `Mask upload failed: ${message}`);
+      }
+    },
+    [addConsoleLog, setStateWithHistory],
+  );
+
+  useEffect(() => {
+    if (selectedJointId && selectedJointId in state.joints) {
+      setMaskJointId(selectedJointId);
+      maskJointIdRef.current = selectedJointId;
+      return;
+    }
+    maskJointIdRef.current = maskJointId;
+  }, [maskJointId, selectedJointId, state.joints]);
+
+  const uploadJointMaskFile = useCallback(
+    async (file: File, jointId: string) => {
+      try {
+        const url = URL.createObjectURL(file);
+        setStateWithHistory(`upload_joint_mask:${jointId}`, (prev) => ({
+          ...prev,
+          scene: {
+            ...prev.scene,
+            jointMasks: {
+              ...prev.scene.jointMasks,
+              [jointId]: {
+                ...prev.scene.jointMasks[jointId],
+                src: url,
+                visible: true,
+              },
+            },
+          },
+        }));
+        addConsoleLog('success', `Mask uploaded for ${jointId}: ${file.name}`);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Unknown error';
+        alert(`Mask upload failed: ${message}`);
+        addConsoleLog('error', `Mask upload failed: ${message}`);
+      }
+    },
+    [addConsoleLog, setStateWithHistory],
+  );
+
+  const undo = useCallback(() => {
+    setTimelinePlaying(false);
+    setDraggingId(null);
+    setState((prev) => historyCtrlRef.current.undo(prev));
+    addConsoleLog('info', 'Undo');
+  }, [addConsoleLog]);
+
+  const redo = useCallback(() => {
+    setTimelinePlaying(false);
+    setDraggingId(null);
+    setState((prev) => historyCtrlRef.current.redo(prev));
+    addConsoleLog('info', 'Redo');
+  }, [addConsoleLog]);
+
+  useEffect(() => {
+    const isEditableTarget = (target: EventTarget | null) => {
+      const el = target as HTMLElement | null;
+      if (!el) return false;
+      if (el.isContentEditable) return true;
+      const tag = el.tagName;
+      return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+    };
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.defaultPrevented) return;
+      if (isEditableTarget(e.target)) return;
+
+      const mod = e.metaKey || e.ctrlKey;
+      const key = e.key.toLowerCase();
+
+      if (mod) {
+        if (key === 'z') {
+          e.preventDefault();
+          if (e.shiftKey) {
+            redo();
+          } else {
+            undo();
+          }
+          return;
+        }
+        if (key === 'y') {
+          e.preventDefault();
+          redo();
+          return;
+        }
+        return;
+      }
+
+      // Non-modifier shortcuts.
+      if (key === 'b') {
+        e.preventDefault();
+        setStateWithHistory('toggle_bend_shortcut', (prev) => ({ ...prev, bendEnabled: !prev.bendEnabled }));
+        return;
+      }
+      if (key === 's') {
+        e.preventDefault();
+        setStateWithHistory('toggle_stretch_shortcut', (prev) => ({ ...prev, stretchEnabled: !prev.stretchEnabled }));
+        return;
+      }
+      if (key === 'm') {
+        e.preventDefault();
+        setStateWithHistory('toggle_mirroring_shortcut', (prev) => ({ ...prev, mirroring: !prev.mirroring }));
+        return;
+      }
+      if (key === 'l') {
+        e.preventDefault();
+        setStateWithHistory('toggle_lead_shortcut', (prev) => ({ ...prev, leadEnabled: !prev.leadEnabled }));
+        return;
+      }
+      if (key === 'o') {
+        e.preventDefault();
+        if (!state.timeline.enabled) return;
+        setTimelinePlaying(false);
+        setStateWithHistory('toggle_onion_shortcut', (prev) => ({
+          ...prev,
+          timeline: {
+            ...prev.timeline,
+            onionSkin: { ...prev.timeline.onionSkin, enabled: !prev.timeline.onionSkin.enabled },
+          },
+        }));
+        return;
+      }
+      if (e.key === ' ') {
+        // Space toggles play/pause when timeline is enabled.
+        if (!state.timeline.enabled) return;
+        e.preventDefault();
+        if (timelinePlaying) {
+          setTimelinePlaying(false);
+        } else {
+          timelineFrameRef.current = timelineFrame;
+          setTimelinePlaying(true);
+        }
+        return;
+      }
+      if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+        if (!state.timeline.enabled) return;
+        e.preventDefault();
+        setTimelinePlaying(false);
+        const delta = e.key === 'ArrowLeft' ? -1 : 1;
+        const maxFrame = Math.max(0, state.timeline.clip.frameCount - 1);
+        const nextFrame = clamp(timelineFrameRef.current + delta, 0, maxFrame);
+        timelineFrameRef.current = nextFrame;
+        setTimelineFrame(nextFrame);
+      }
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [
+    redo,
+    state.timeline.clip.frameCount,
+    state.timeline.enabled,
+    setStateWithHistory,
+    timelineFrame,
+    timelinePlaying,
+    undo,
+  ]);
+
+  useEffect(() => {
+    timelineFrameRef.current = timelineFrame;
+  }, [timelineFrame]);
+
+  useEffect(() => {
+    if (!state.timeline.enabled) {
+      setTimelinePlaying(false);
+    }
+  }, [state.timeline.enabled]);
+
+  useEffect(() => {
+    const maxFrame = Math.max(0, state.timeline.clip.frameCount - 1);
+    setTimelineFrame((f) => clamp(f, 0, maxFrame));
+  }, [state.timeline.clip.frameCount]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      try {
+        localStorage.setItem(LOCAL_STORAGE_KEY, serializeEngineState(state));
+      } catch {
+        // Ignore quota / serialization errors to avoid breaking the editor loop.
+      }
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [state]);
+
+  useEffect(() => {
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        setCanvasSize({
+          width: entry.contentRect.width,
+          height: entry.contentRect.height
+        });
+      }
+    });
+    if (canvasRef.current) observer.observe(canvasRef.current);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/grid_rings_background.json')
+      .then(r => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (cancelled) return;
+        setGridRingsBgData(data);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setGridRingsBgData(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!gridRingsBg) {
+      setGridOverlayTransform(null);
+      return;
+    }
+    if (!canvasSize.width || !canvasSize.height) return;
+
+    const bounds = gridRingsBg.vitruvian.plot.bounds;
+    const scale = 20;
+    const centerX = canvasSize.width / 2;
+    const centerY = canvasSize.height / 2;
+    const vmin = Math.min(canvasSize.width, canvasSize.height);
+
+    // Calibrate against the *starting pose* so the grid stays static while the figure moves.
+    const headWorld = getWorldPosition('head', INITIAL_JOINTS, INITIAL_JOINTS, 'current');
+    const lAnkleWorld = getWorldPosition('l_ankle', INITIAL_JOINTS, INITIAL_JOINTS, 'current');
+    const rAnkleWorld = getWorldPosition('r_ankle', INITIAL_JOINTS, INITIAL_JOINTS, 'current');
+
+    const headX = headWorld.x * scale + centerX;
+    const headY = headWorld.y * scale + centerY;
+    const lAnkleX = lAnkleWorld.x * scale + centerX;
+    const lAnkleY = lAnkleWorld.y * scale + centerY;
+    const rAnkleX = rAnkleWorld.x * scale + centerX;
+    const rAnkleY = rAnkleWorld.y * scale + centerY;
+
+    const crownY = headY;
+    const groundY = Math.max(lAnkleY, rAnkleY);
+    const figureHeightPx = Math.max(1, groundY - crownY);
+
+    const anklesAvgX = (lAnkleX + rAnkleX) / 2;
+    const characterCenterX = (headX + anklesAvgX) / 2;
+    const characterCenterY = (crownY + groundY) / 2;
+
+    // Keep the full rings circle inside the viewing window.
+    const maxRingR = Math.max(...gridRingsBg.vitruvian.plot.circles.map(c => c.r), 0.55);
+    const fitRingsPxPerUnit = maxRingR > 0 ? (vmin / 2) / maxRingR : 0;
+    const calibratedPxPerUnit = figureHeightPx; // grid totalHeight is 1
+    const pxPerUnit = Math.min(calibratedPxPerUnit, fitRingsPxPerUnit);
+
+    const headLenUnits = 0.125;
+    const headLenPx = pxPerUnit * headLenUnits;
+    const fingerLenPx = headLenPx / 8;
+
+    setGridOverlayTransform({
+      characterCenterX,
+      characterCenterY,
+      pxPerUnit,
+      headLenPx,
+      fingerLenPx,
+      vmin,
+    });
+  }, [gridRingsBg, canvasSize.width, canvasSize.height]);
+
+  // Animation Loop: Exponential Decay for Smooth Motion
+  useEffect(() => {
+    let frameId: number;
+    let last = performance.now();
+    const update = () => {
+      setState(prev => {
+        const nextJoints = { ...prev.joints };
+        let changed = false;
+        const now = performance.now();
+        const dt = Math.max(0, (now - last) / 1000);
+        last = now;
+
+        // While the user is actively dragging (joint or mask), the rig should
+        // track the cursor exactly (no smoothing/lead lag).
+        const isDirectManipulation = Boolean(draggingIdLiveRef.current) || maskDraggingLiveRef.current;
+
+        // Convert snappiness into a stable per-frame alpha.
+        // - When snappiness=1, snaps immediately.
+        // - When snappiness is small, follows smoothly; dt keeps it consistent across FPS.
+        const sn = clamp(prev.snappiness, 0.05, 1.0);
+        const alpha = isDirectManipulation ? 1 : 1 - Math.pow(1 - sn, dt * 60);
+
+        Object.keys(nextJoints).forEach(id => {
+          const joint = nextJoints[id];
+
+          // 1) Preview -> Target (Lead)
+          const nextTarget = prev.leadEnabled && !isDirectManipulation
+            ? {
+                x: joint.targetOffset.x + (joint.previewOffset.x - joint.targetOffset.x) * alpha,
+                y: joint.targetOffset.y + (joint.previewOffset.y - joint.targetOffset.y) * alpha,
+              }
+            : { ...joint.previewOffset };
+
+          // 2) Target -> Current (Mesh/Reality)
+          const nextCurrent = {
+            x: joint.currentOffset.x + (nextTarget.x - joint.currentOffset.x) * alpha,
+            y: joint.currentOffset.y + (nextTarget.y - joint.currentOffset.y) * alpha,
+          };
+
+          const tdX = nextTarget.x - joint.targetOffset.x;
+          const tdY = nextTarget.y - joint.targetOffset.y;
+          const cdX = nextCurrent.x - joint.currentOffset.x;
+          const cdY = nextCurrent.y - joint.currentOffset.y;
+          if (Math.abs(tdX) > 0.0001 || Math.abs(tdY) > 0.0001 || Math.abs(cdX) > 0.0001 || Math.abs(cdY) > 0.0001) {
+            nextJoints[id] = {
+              ...joint,
+              targetOffset: nextTarget,
+              currentOffset: nextCurrent,
+            };
+            changed = true;
+          }
+        });
+
+        if (changed) return { ...prev, joints: nextJoints };
+        return prev;
+      });
+      frameId = requestAnimationFrame(update);
+    };
+    frameId = requestAnimationFrame(update);
+    return () => cancelAnimationFrame(frameId);
+  }, []);
+
+  useEffect(() => {
+    if (!state.timeline.enabled) return;
+    if (!timelinePlaying) return;
+
+    let rafId = 0;
+    let last = performance.now();
+    let acc = 0;
+
+    const fps = Math.max(1, Math.floor(state.timeline.clip.fps));
+    const frameCount = Math.max(1, Math.floor(state.timeline.clip.frameCount));
+    const frameStep = 1 / fps;
+
+    const tick = (now: number) => {
+      const dt = (now - last) / 1000;
+      last = now;
+      acc += dt;
+
+      let advance = 0;
+      while (acc >= frameStep) {
+        acc -= frameStep;
+        advance += 1;
+        if (advance >= 5) {
+          // Prevent huge catch-up spikes (tab backgrounding, etc.).
+          acc = 0;
+          break;
+        }
+      }
+
+      if (advance > 0) {
+        const nextFrame = (timelineFrameRef.current + advance) % frameCount;
+        timelineFrameRef.current = nextFrame;
+        setTimelineFrame(nextFrame);
+        setState((prev) => {
+          const pose = sampleClipPose(prev.timeline.clip, nextFrame, prev.joints, {
+            stretchEnabled: prev.stretchEnabled,
+          });
+          if (!pose) return prev;
+          return { ...prev, joints: applyPoseSnapshotToJoints(prev.joints, pose) };
+        });
+      }
+
+      rafId = requestAnimationFrame(tick);
+    };
+
+    rafId = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafId);
+  }, [
+    state.timeline.enabled,
+    state.timeline.clip.easing,
+    state.timeline.clip.fps,
+    state.timeline.clip.frameCount,
+    state.timeline.clip.keyframes,
+    timelinePlaying,
+  ]);
+
+  useEffect(() => {
+    if (!state.timeline.enabled) return;
+    if (timelinePlaying) return;
+    setState((prev) => {
+      const pose = sampleClipPose(prev.timeline.clip, timelineFrame, prev.joints, { stretchEnabled: prev.stretchEnabled });
+      if (!pose) return prev;
+      return { ...prev, joints: applyPoseSnapshotToJoints(prev.joints, pose) };
+    });
+  }, [state.timeline.enabled, state.timeline.clip, timelineFrame, timelinePlaying]);
+
+  const handleMouseDown = (id: string) => (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setTimelinePlaying(false);
+    setSelectedJointId(id);
+    historyCtrlRef.current.beginAction(`drag:${id}`, state);
+    draggingIdLiveRef.current = id;
+    pinWorldRef.current = state.activePins.reduce<Record<string, Point>>((acc, pinId) => {
+      acc[pinId] = getWorldPosition(pinId, state.joints, INITIAL_JOINTS, 'preview');
+      return acc;
+    }, {});
+    setDraggingId(id);
+  };
+
+  const handleMaskMouseDown = (jointId: string) => (e: React.MouseEvent) => {
+    if (!maskEditArmed) return;
+    e.stopPropagation();
+    setTimelinePlaying(false);
+    setSelectedJointId(jointId);
+    const mask = state.scene.jointMasks[jointId];
+    if (!mask?.src || !mask.visible) return;
+    historyCtrlRef.current.beginAction(`mask_drag:${jointId}`, state);
+    maskDraggingLiveRef.current = true;
+    setMaskDragging({
+      jointId,
+      startClientX: e.clientX,
+      startClientY: e.clientY,
+      startOffsetX: mask.offsetX,
+      startOffsetY: mask.offsetY,
+    });
+  };
+
+  const handleMouseMove = useCallback(
+    (e: React.MouseEvent) => {
+      if (!canvasRef.current) return;
+
+      if (maskDragging) {
+        maskDraggingLiveRef.current = true;
+        const dx = e.clientX - maskDragging.startClientX;
+        const dy = e.clientY - maskDragging.startClientY;
+        const jointId = maskDragging.jointId;
+        setState((prev) => {
+          const mask = prev.scene.jointMasks[jointId];
+          if (!mask) return prev;
+          return {
+            ...prev,
+            scene: {
+              ...prev.scene,
+              jointMasks: {
+                ...prev.scene.jointMasks,
+                [jointId]: {
+                  ...mask,
+                  offsetX: maskDragging.startOffsetX + dx,
+                  offsetY: maskDragging.startOffsetY + dy,
+                },
+              },
+            },
+          };
+        });
+        return;
+      }
+
+      if (!draggingId) return;
+      draggingIdLiveRef.current = draggingId;
+
+      const rect = canvasRef.current.getBoundingClientRect();
+      const centerX = rect.width / 2;
+      const centerY = rect.height / 2;
+      const scale = 20; // Pixels per unit
+
+      const mouseX = (e.clientX - rect.left - centerX) / scale;
+      const mouseY = (e.clientY - rect.top - centerY) / scale;
+
+      const pinWorld = pinWorldRef.current;
+      const hasPinnedFeet = Boolean(pinWorld && ('l_ankle' in pinWorld || 'r_ankle' in pinWorld));
+      const isBalanceHandle =
+        draggingId === 'head' ||
+        draggingId === 'cranium' ||
+        draggingId === 'neck_base' ||
+        draggingId === 'sternum' ||
+        draggingId === 'navel' ||
+        draggingId === 'sacrum' ||
+        draggingId === 'l_hip' ||
+        draggingId === 'r_hip';
+
+      if (hasPinnedFeet && isBalanceHandle) {
+        setState((prev) =>
+          (prev.controlMode === 'IK' || prev.controlMode === 'Hybrid') && pinWorld
+            ? applyBalanceDragToState(prev, draggingId, { x: mouseX, y: mouseY }, pinWorld)
+            : applyDragToState(prev, draggingId, { x: mouseX, y: mouseY }),
+        );
+      } else {
+        setState((prev) => applyDragToState(prev, draggingId, { x: mouseX, y: mouseY }));
+      }
+    },
+    [draggingId, maskDragging],
+  );
+
+  const handleMouseUp = () => {
+    if (maskDragging) {
+      setMaskDragging(null);
+      setMaskEditArmed(false);
+    }
+    maskDraggingLiveRef.current = false;
+    draggingIdLiveRef.current = null;
+    pinWorldRef.current = null;
+    setDraggingId(null);
+    setState((prev) => {
+      const changed = historyCtrlRef.current.commitAction(prev);
+      return changed ? { ...prev } : prev;
+    });
+  };
+
+  const setJointAngleDeg = useCallback((jointId: string, angleDeg: number) => {
+    setState((prev) => {
+      const joint = prev.joints[jointId];
+      if (!joint || !joint.parent) return prev;
+
+      const baseLen = vectorLength(joint.baseOffset);
+      const currentLen = vectorLength(joint.previewOffset);
+      const len = prev.stretchEnabled ? (currentLen || baseLen) : (baseLen || currentLen);
+      if (!len) return prev;
+
+      const nextOffset = fromAngleDeg(angleDeg, len);
+      const nextJoints = { ...prev.joints };
+      nextJoints[jointId] = {
+        ...joint,
+        previewOffset: nextOffset,
+        targetOffset: nextOffset,
+        currentOffset: nextOffset,
+      };
+
+      if (prev.mirroring && joint.mirrorId && nextJoints[joint.mirrorId]) {
+        const mirror = nextJoints[joint.mirrorId];
+        const mirroredOffset = { x: -nextOffset.x, y: nextOffset.y };
+        nextJoints[joint.mirrorId] = {
+          ...mirror,
+          previewOffset: mirroredOffset,
+          targetOffset: mirroredOffset,
+          currentOffset: mirroredOffset,
+        };
+      }
+
+      return { ...prev, joints: nextJoints };
+    });
+  }, []);
+
+  const applyTimelineFrame = useCallback(
+    (frameRaw: number) => {
+      setTimelinePlaying(false);
+      const maxFrame = Math.max(0, state.timeline.clip.frameCount - 1);
+      const frame = clamp(Math.floor(frameRaw), 0, maxFrame);
+      timelineFrameRef.current = frame;
+      setTimelineFrame(frame);
+    },
+    [state.timeline.clip.frameCount],
+  );
+
+  const setKeyframeHere = useCallback(() => {
+    setTimelinePlaying(false);
+    setStateWithHistory('timeline_set_keyframe', (prev) => {
+      const frameCount = Math.max(1, Math.floor(prev.timeline.clip.frameCount));
+      const frame = clamp(timelineFrame, 0, frameCount - 1);
+      const pose = capturePoseSnapshot(prev.joints, 'preview');
+
+      const keyframes = prev.timeline.clip.keyframes.filter((k) => k.frame !== frame);
+      keyframes.push({ frame, pose });
+      keyframes.sort((a, b) => a.frame - b.frame);
+
+      return {
+        ...prev,
+        timeline: {
+          ...prev.timeline,
+          clip: {
+            ...prev.timeline.clip,
+            keyframes,
+          },
+        },
+      };
+    });
+  }, [setStateWithHistory, timelineFrame]);
+
+  const deleteKeyframeHere = useCallback(() => {
+    setTimelinePlaying(false);
+    setStateWithHistory('timeline_delete_keyframe', (prev) => {
+      const frameCount = Math.max(1, Math.floor(prev.timeline.clip.frameCount));
+      const frame = clamp(timelineFrame, 0, frameCount - 1);
+      const keyframes = prev.timeline.clip.keyframes.filter((k) => k.frame !== frame);
+      if (keyframes.length === prev.timeline.clip.keyframes.length) return prev;
+      return {
+        ...prev,
+        timeline: {
+          ...prev.timeline,
+          clip: {
+            ...prev.timeline.clip,
+            keyframes,
+          },
+        },
+      };
+    });
+  }, [setStateWithHistory, timelineFrame]);
+
+  const resetSkeleton = () => {
+    setStateWithHistory('reset_engine', (prev) => ({
+      ...prev,
+      joints: sanitizeJoints(null),
+    }));
+  };
+
+  const togglePin = (id: string) => {
+    setStateWithHistory('toggle_pin', (prev) => ({
+      ...prev,
+      activePins: prev.activePins.includes(id)
+        ? prev.activePins.filter((p) => p !== id)
+        : [...prev.activePins, id],
+    }));
+  };
+
+  const renderConnection = (conn: Connection) => {
+    const fromJoint = state.joints[conn.from];
+    const toJoint = state.joints[conn.to];
+    if (!fromJoint || !toJoint) return null;
+
+    const start = getWorldPosition(conn.from, state.joints, INITIAL_JOINTS);
+    const end = getWorldPosition(conn.to, state.joints, INITIAL_JOINTS);
+    
+    const ghostStart = getWorldPosition(conn.from, state.joints, INITIAL_JOINTS, 'preview');
+    const ghostEnd = getWorldPosition(conn.to, state.joints, INITIAL_JOINTS, 'preview');
+
+    const scale = 20;
+    const centerX = canvasSize.width / 2;
+    const centerY = canvasSize.height / 2;
+
+    const x1 = start.x * scale + centerX;
+    const y1 = start.y * scale + centerY;
+    const x2 = end.x * scale + centerX;
+    const y2 = end.y * scale + centerY;
+    
+    const gx1 = ghostStart.x * scale + centerX;
+    const gy1 = ghostStart.y * scale + centerY;
+    const gx2 = ghostEnd.x * scale + centerX;
+    const gy2 = ghostEnd.y * scale + centerY;
+
+    if (isNaN(x1) || isNaN(y1) || isNaN(x2) || isNaN(y2)) return null;
+
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const len = Math.sqrt(dx * dx + dy * dy);
+    const angle = Math.atan2(dy, dx) * (180 / Math.PI);
+
+    // Styling based on connection type
+    const useGridPalette = true;
+    let strokeColor = "#2b0057";
+    let strokeWidth = 4;
+    let opacity = 0.9;
+    let dashArray = "";
+
+    if (conn.type === 'soft_limit') {
+      strokeWidth = 2;
+      opacity = 0.6;
+      dashArray = "2 2";
+    } else if (conn.type === 'structural_link') {
+      strokeWidth = 1;
+      opacity = 0.3;
+      strokeColor = useGridPalette ? "rgba(43, 0, 87, 0.55)" : "#666";
+    }
+
+    const renderShape = () => {
+      const shape = conn.shape || 'standard';
+      
+      switch (shape) {
+        case 'muscle':
+          return (
+            <path
+              d={`
+                M 0,0
+                Q ${len * 0.5}, -15 ${len}, 0
+                Q ${len * 0.5}, 15 0, 0
+                Z
+              `}
+              fill={strokeColor}
+              transform={`translate(${x1}, ${y1}) rotate(${angle})`}
+              style={{ opacity }}
+            />
+          );
+        case 'tapered':
+          return (
+             <path
+              d={`
+                M 0,-4
+                L ${len}, -1
+                L ${len}, 1
+                L 0, 4
+                Z
+              `}
+              fill={strokeColor}
+              transform={`translate(${x1}, ${y1}) rotate(${angle})`}
+              style={{ opacity }}
+            />
+          );
+        case 'cylinder':
+           return (
+            <rect
+              x="0" y="-4" width={len} height="8"
+              fill={strokeColor}
+              transform={`translate(${x1}, ${y1}) rotate(${angle})`}
+              style={{ opacity }}
+            />
+          );
+        case 'wire':
+          return (
+            <line
+              x1={x1} y1={y1} x2={x2} y2={y2}
+              stroke={strokeColor}
+              strokeWidth="2"
+              style={{ opacity }}
+            />
+          );
+        case 'standard':
+        default:
+          return (
+            <path
+              d={`
+                M 0,-5 
+                L ${len * 0.2},-2 
+                L ${len * 0.8},-2 
+                L ${len},-5 
+                L ${len},5 
+                L ${len * 0.8},2 
+                L ${len * 0.2},2 
+                L 0,5 
+                Z
+              `}
+              fill={strokeColor}
+              transform={`translate(${x1}, ${y1}) rotate(${angle})`}
+              style={{ opacity }}
+            />
+          );
+      }
+    };
+
+    return (
+      <g key={`conn-${conn.from}-${conn.to}`}>
+        {/* Main Connection Shape */}
+        {renderShape()}
+      </g>
+    );
+  };
+
+  const renderJoint = (id: string) => {
+    const joint = state.joints[id];
+    const pos = getWorldPosition(id, state.joints, INITIAL_JOINTS);
+    const isRoot = !joint.parent;
+    const isSelected = selectedJointId === id;
+
+    const scale = 20;
+    const centerX = canvasSize.width / 2;
+    const centerY = canvasSize.height / 2;
+
+    const x = pos.x * scale + centerX;
+    const y = pos.y * scale + centerY;
+
+    if (isNaN(x) || isNaN(y)) return null;
+
+    const isNipple = id.includes('nipple');
+
+    if (isNipple) {
+      const size = 4;
+      return (
+        <g key={`joint-${id}`} className="cursor-grab active:cursor-grabbing" onMouseDown={handleMouseDown(id)}>
+          <line x1={x - size} y1={y - size} x2={x + size} y2={y + size} stroke="#666" strokeWidth="1.5" />
+          <line x1={x + size} y1={y - size} x2={x - size} y2={y + size} stroke="#666" strokeWidth="1.5" />
+        </g>
+      );
+    }
+
+    return (
+      <circle
+        key={`joint-${id}`}
+        cx={x} cy={y} r={isRoot ? 6 : (draggingId === id ? 6 : 4)}
+        fill={isRoot ? "white" : (state.activePins.includes(id) ? "#ff0066" : "var(--accent)")}
+        stroke={isSelected ? 'rgba(255, 255, 255, 0.9)' : 'var(--bg)'}
+        strokeWidth={isSelected ? 3 : 2}
+        className="cursor-grab active:cursor-grabbing"
+        onMouseDown={handleMouseDown(id)}
+      />
+    );
+  };
+
+  const hasSceneImages =
+    Boolean(state.scene.background.src) ||
+    Boolean(state.scene.foreground.src) ||
+    Boolean(state.scene.headMask?.src) ||
+    Object.values(state.scene.jointMasks).some((m) => Boolean(m?.src));
+
+  const showEditorGrid = Boolean(gridRingsBg) || hasSceneImages;
+
+  return (
+    <div
+      className="flex h-screen w-full bg-[#0a0a0a] text-[#e0e0e0] font-sans selection:bg-white/20"
+      data-build-id={BUILD_ID}
+    >
+      {/* Sidebar */}
+      <motion.aside 
+        initial={false}
+        animate={{ width: sidebarOpen ? 360 : 0 }}
+        className="relative bg-[#121212] border-r border-[#222] overflow-hidden flex flex-col"
+      >
+        <div className="w-[360px] h-full flex flex-col">
+          <div className="p-6 pb-4">
+            <div className="flex items-center gap-3">
+              <div className="p-2 bg-white rounded-lg">
+                <Activity size={20} className="text-black" />
+              </div>
+              <div>
+                <h1 className="text-lg font-bold tracking-tight">BITRUVIUS</h1>
+                <p className="text-[10px] text-[#666] uppercase tracking-[0.2em] font-mono">
+                  Core Engine v0.2 · build {BUILD_ID}
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <div className="flex-1 overflow-y-auto px-6 pb-6">
+            <div className="space-y-6">
+            <section>
+              <div className="flex items-center gap-2 mb-4 text-[#666]">
+                <Move size={14} />
+                <h2 className="text-[10px] font-bold uppercase tracking-widest">Edit</h2>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={undo}
+                  disabled={!canUndo}
+                  className={`flex items-center justify-center gap-2 py-2 rounded-lg text-[10px] font-bold uppercase transition-all ${
+                    canUndo ? 'bg-[#222] hover:bg-[#333]' : 'bg-[#181818] text-[#444] cursor-not-allowed'
+                  }`}
+                  title="Undo (Ctrl/Cmd+Z)"
+                >
+                  <RotateCcw size={12} />
+                  Undo
+                </button>
+                <button
+                  type="button"
+                  onClick={redo}
+                  disabled={!canRedo}
+                  className={`flex items-center justify-center gap-2 py-2 rounded-lg text-[10px] font-bold uppercase transition-all ${
+                    canRedo ? 'bg-[#222] hover:bg-[#333]' : 'bg-[#181818] text-[#444] cursor-not-allowed'
+                  }`}
+                  title="Redo (Ctrl+Y / Ctrl/Cmd+Shift+Z)"
+                >
+                  <RotateCw size={12} />
+                  Redo
+                </button>
+              </div>
+            </section>
+
+            <section>
+              <div className="flex items-center gap-2 mb-4 text-[#666]">
+                <Anchor size={14} />
+                <h2 className="text-[10px] font-bold uppercase tracking-widest">Widgets</h2>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                {(
+                  [
+                    { kind: 'joint_masks' as const, label: 'Joint Masks' },
+                    { kind: 'console' as const, label: 'Console' },
+                  ] as const
+                ).map(({ kind, label }) => (
+                  <button
+                    key={kind}
+                    type="button"
+                    draggable
+                    onDragStart={(e) => {
+                      e.dataTransfer.setData(DND_WIDGET_MIME, kind);
+                      e.dataTransfer.effectAllowed = 'copy';
+                    }}
+                    onClick={() => {
+                      const rect = canvasRef.current?.getBoundingClientRect();
+                      const cx = rect ? rect.left + rect.width / 2 : window.innerWidth / 2;
+                      const cy = rect ? rect.top + rect.height / 2 : window.innerHeight / 2;
+                      spawnFloatingWidget(kind, cx, cy);
+                    }}
+                    className="py-2 rounded-lg text-[10px] font-bold uppercase transition-all bg-[#222] hover:bg-[#333]"
+                    title="Drag onto canvas or click to spawn"
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <p className="mt-2 text-[10px] text-[#444]">
+                Drag buttons onto the canvas to spawn floating tools.
+              </p>
+            </section>
+
+            <section>
+              <div className="flex items-center gap-2 mb-4 text-[#666]">
+                <Settings2 size={14} />
+                <h2 className="text-[10px] font-bold uppercase tracking-widest">Control Modes</h2>
+              </div>
+              <div className="flex bg-[#222] rounded-xl p-1 mb-4">
+                {(['FK', 'Hybrid', 'IK'] as const).map(mode => (
+                  <button
+                    key={mode}
+                    onClick={() =>
+                      setStateWithHistory('set_control_mode', (prev) =>
+                        prev.controlMode === mode ? prev : { ...prev, controlMode: mode },
+                      )
+                    }
+                    className={`flex-1 py-2 rounded-lg text-[10px] font-bold uppercase transition-all ${state.controlMode === mode ? 'bg-white text-black' : 'text-[#666] hover:text-white'}`}
+                  >
+                    {mode}
+                  </button>
+                ))}
+              </div>
+              <div className="space-y-2">
+                <Toggle 
+                  label="Mirroring" 
+                  active={state.mirroring} 
+                  onClick={() =>
+                    setStateWithHistory('toggle_mirroring', (prev) => ({
+                      ...prev,
+                      mirroring: !prev.mirroring,
+                    }))
+                  }
+                />
+                <Toggle 
+                  label="Auto-Bend (B)" 
+                  active={state.bendEnabled} 
+                  onClick={() =>
+                    setStateWithHistory('toggle_bend', (prev) => ({
+                      ...prev,
+                      bendEnabled: !prev.bendEnabled,
+                    }))
+                  }
+                />
+	                <Toggle 
+	                  label="Elasticity (S)" 
+	                  active={state.stretchEnabled} 
+	                  onClick={() =>
+	                    setStateWithHistory('toggle_stretch', (prev) => ({
+	                      ...prev,
+	                      stretchEnabled: !prev.stretchEnabled,
+	                    }))
+	                  }
+	                />
+                  <Toggle
+                    label="Lead (L)"
+                    active={state.leadEnabled}
+                    onClick={() =>
+                      setStateWithHistory('toggle_lead', (prev) => ({
+                        ...prev,
+                        leadEnabled: !prev.leadEnabled,
+                      }))
+                    }
+                  />
+	                <Toggle 
+	                  label="Hard Stop" 
+	                  active={state.hardStop} 
+	                  onClick={() =>
+                    setStateWithHistory('toggle_hard_stop', (prev) => ({
+                      ...prev,
+                      hardStop: !prev.hardStop,
+                    }))
+                  }
+                />
+              </div>
+            </section>
+
+            <section>
+              <div className="flex items-center gap-2 mb-4 text-[#666]">
+                <Activity size={14} />
+                <h2 className="text-[10px] font-bold uppercase tracking-widest">Live Feedback</h2>
+              </div>
+              <div className="space-y-4">
+                <div className="space-y-2">
+                  <div className="flex justify-between text-[10px] font-bold uppercase tracking-widest text-[#444]">
+                    <span>Snappiness</span>
+                    <span className="text-white">{(state.snappiness * 100).toFixed(0)}%</span>
+                  </div>
+	                  <input 
+	                    type="range" 
+	                    min="0.05" 
+	                    max="1.0" 
+	                    step="0.05"
+	                    value={state.snappiness}
+	                    onPointerDown={() => {
+                        setTimelinePlaying(false);
+                        historyCtrlRef.current.beginAction('snappiness', state);
+                      }}
+                    onPointerUp={() =>
+                      setState((prev) => {
+                        const changed = historyCtrlRef.current.commitAction(prev);
+                        return changed ? { ...prev } : prev;
+                      })
+                    }
+                    onPointerCancel={() =>
+                      setState((prev) => {
+                        const changed = historyCtrlRef.current.commitAction(prev);
+                        return changed ? { ...prev } : prev;
+                      })
+                    }
+                    onChange={(e) =>
+                      setState((s) => ({ ...s, snappiness: parseFloat(e.target.value) }))
+                    }
+                    className="w-full accent-white bg-[#222] h-1 rounded-full appearance-none cursor-pointer"
+                  />
+                </div>
+              </div>
+            </section>
+
+            <section>
+              <div className="flex items-center gap-2 mb-4 text-[#666]">
+                <Maximize2 size={14} />
+                <h2 className="text-[10px] font-bold uppercase tracking-widest">View Modes</h2>
+              </div>
+	              <div className="grid grid-cols-2 gap-2">
+	                {viewModes.map(mode => (
+	                  <button
+	                    key={mode.id}
+                    onClick={() =>
+                      setStateWithHistory('set_view_mode', (prev) =>
+                        prev.viewMode === mode.id ? prev : { ...prev, viewMode: mode.id },
+                      )
+                    }
+                    className={`p-2 rounded-lg border text-[10px] font-bold uppercase transition-all ${state.viewMode === mode.id ? 'bg-white text-black border-white' : 'bg-transparent text-[#666] border-[#222] hover:border-[#444]'}`}
+                  >
+                    {mode.label}
+                  </button>
+	                ))}
+	              </div>
+	            </section>
+
+              <section>
+                <div className="flex items-center gap-2 mb-4 text-[#666]">
+                  <RotateCcw size={14} />
+                  <h2 className="text-[10px] font-bold uppercase tracking-widest">Animation</h2>
+                </div>
+                <div className="space-y-2">
+                  <Toggle
+                    label="Timeline"
+                    active={state.timeline.enabled}
+                    onClick={() => {
+                      setTimelinePlaying(false);
+                      setStateWithHistory('toggle_timeline', (prev) => ({
+                        ...prev,
+                        timeline: {
+                          ...prev.timeline,
+                          enabled: !prev.timeline.enabled,
+                        },
+                      }));
+                    }}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setTimelinePlaying(false);
+                      setStateWithHistory('timeline_clear_keys', (prev) => ({
+                        ...prev,
+                        timeline: {
+                          ...prev.timeline,
+                          clip: { ...prev.timeline.clip, keyframes: [] },
+                        },
+                      }));
+                    }}
+                    disabled={state.timeline.clip.keyframes.length === 0}
+                    className={`w-full flex items-center justify-center gap-2 py-2 rounded-lg text-[10px] font-bold uppercase transition-all ${
+                      state.timeline.clip.keyframes.length > 0
+                        ? 'bg-[#222] hover:bg-[#333]'
+                        : 'bg-[#181818] text-[#444] cursor-not-allowed'
+                    }`}
+                    title="Clear all keyframes"
+                  >
+                    <Trash2 size={12} />
+                    Clear Keys
+                  </button>
+                </div>
+              </section>
+
+	            <section>
+	              <div className="flex items-center gap-2 mb-4 text-[#666]">
+	                <Download size={14} />
+	                <h2 className="text-[10px] font-bold uppercase tracking-widest">Transfer</h2>
+	              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={downloadStateJson}
+                  className="py-2 bg-[#222] hover:bg-[#333] rounded-lg text-[10px] font-bold uppercase transition-all"
+                >
+                  Save JSON
+                </button>
+                <button
+                  type="button"
+                  onClick={() => importStateInputRef.current?.click()}
+                  className="py-2 bg-[#222] hover:bg-[#333] rounded-lg text-[10px] font-bold uppercase transition-all"
+                >
+                  Load JSON
+                </button>
+              </div>
+              <input
+                ref={importStateInputRef}
+                type="file"
+                accept="application/json"
+                className="hidden"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (!file) return;
+                  void importStateFile(file);
+                  e.target.value = '';
+                }}
+	              />
+	            </section>
+
+	            <section>
+	              <div className="flex items-center gap-2 mb-4 text-[#666]">
+	                <Upload size={14} />
+	                <h2 className="text-[10px] font-bold uppercase tracking-widest">Export</h2>
+	              </div>
+		              <div className="grid grid-cols-2 gap-2">
+		                <button
+		                  type="button"
+		                  onClick={exportSvg}
+		                  disabled={!canvasSize.width || !canvasSize.height}
+	                  className={`py-2 rounded-lg text-[10px] font-bold uppercase transition-all ${
+	                    canvasSize.width && canvasSize.height
+	                      ? 'bg-[#222] hover:bg-[#333]'
+	                      : 'bg-[#181818] text-[#444] cursor-not-allowed'
+	                  }`}
+	                >
+	                  Export SVG
+	                </button>
+	                <button
+	                  type="button"
+	                  onClick={() => void exportPng()}
+	                  disabled={!canvasSize.width || !canvasSize.height}
+	                  className={`py-2 rounded-lg text-[10px] font-bold uppercase transition-all ${
+	                    canvasSize.width && canvasSize.height
+	                      ? 'bg-[#222] hover:bg-[#333]'
+	                      : 'bg-[#181818] text-[#444] cursor-not-allowed'
+	                  }`}
+		                >
+		                  Export PNG
+		                </button>
+		              </div>
+                  <button
+                    type="button"
+                    onClick={() => void exportVideo()}
+                    disabled={!canvasSize.width || !canvasSize.height || !state.timeline.enabled}
+                    className={`w-full mt-2 py-2 rounded-lg text-[10px] font-bold uppercase transition-all ${
+                      canvasSize.width && canvasSize.height && state.timeline.enabled
+                        ? 'bg-[#222] hover:bg-[#333]'
+                        : 'bg-[#181818] text-[#444] cursor-not-allowed'
+                    }`}
+                    title="Export timeline as WebM"
+                  >
+                    Export WebM
+                  </button>
+		            </section>
+
+	            <section>
+	              <div className="flex items-center gap-2 mb-4 text-[#666]">
+	                <RotateCcw size={14} />
+	                <h2 className="text-[10px] font-bold uppercase tracking-widest">Capture History</h2>
+	              </div>
+              <div className="space-y-2">
+                <button 
+                  onClick={() =>
+                    setPoseSnapshots((h) => {
+                      const { timeline, ...snapshot } = state;
+                      void timeline;
+                      return [snapshot, ...h].slice(0, 5);
+                    })
+                  }
+                  className="w-full py-2 bg-[#222] hover:bg-[#333] rounded-lg text-[10px] font-bold uppercase transition-all"
+                >
+                  Capture Pose
+                </button>
+                <div className="space-y-1">
+                  {poseSnapshots.map((h, i) => (
+                    <button 
+                      key={i}
+                      onClick={() => setStateWithHistory('apply_pose_snapshot', (prev) => ({ ...prev, ...h }))}
+                      className="w-full flex items-center justify-between p-2 rounded-md bg-white/5 hover:bg-white/10 text-[10px] transition-colors"
+                    >
+                      <span>Pose Snapshot {poseSnapshots.length - i}</span>
+                      <span className="text-[#444]">{new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </section>
+
+            <section>
+              <div className="flex items-center gap-2 mb-4 text-[#666]">
+                <Layers size={14} />
+                <h2 className="text-[10px] font-bold uppercase tracking-widest">Scene</h2>
+              </div>
+
+              {/* Guides */}
+              <div className="mb-4">
+                <label className="flex items-center justify-between gap-3 text-[10px]">
+                  <span className="font-bold uppercase tracking-widest text-[#666]">Vitruvian Guides</span>
+                  <input
+                    type="checkbox"
+                    checked={gridRingsEnabled}
+                    disabled={!gridRingsBgData}
+                    onChange={(e) => setGridRingsEnabled(e.target.checked)}
+                    className="rounded disabled:opacity-50"
+                    title={gridRingsBgData ? 'Toggle grid + rings overlay' : 'Guides data missing (grid_rings_background.json)'}
+                  />
+                </label>
+              </div>
+              
+              {/* Background Layer */}
+              <div className="mb-4">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-[10px] font-bold uppercase tracking-widest text-[#666]">Background</span>
+                  <button
+                    onClick={() => document.getElementById('bg-upload')?.click()}
+                    className="px-2 py-1 bg-[#222] hover:bg-[#333] rounded text-[10px] transition-colors"
+                  >
+                    Upload
+                  </button>
+                  <input
+                    id="bg-upload"
+                    type="file"
+                    accept="image/*"
+                    className="hidden"
+                    onChange={async (e) => {
+                      const file = e.target.files?.[0];
+                      if (!file) return;
+                      const url = URL.createObjectURL(file);
+                      setStateWithHistory('upload_background', (prev) => ({
+                        ...prev,
+                        scene: {
+                          ...prev.scene,
+                          background: { ...prev.scene.background, src: url, visible: true }
+                        }
+                      }));
+                    }}
+                  />
+                </div>
+                
+                {state.scene.background.src && (
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={state.scene.background.visible}
+                        onChange={(e) =>
+                          setStateWithHistory('toggle_background', (prev) => ({
+                            ...prev,
+                            scene: {
+                              ...prev.scene,
+                              background: { ...prev.scene.background, visible: e.target.checked }
+                            }
+                          }))
+                        }
+                        className="rounded"
+                      />
+                      <span className="text-[10px]">Visible</span>
+                    </div>
+                    
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-[10px]">
+                        <span>Opacity</span>
+                        <span>{(state.scene.background.opacity * 100).toFixed(0)}%</span>
+                      </div>
+                      <input
+                        type="range"
+                        min="0"
+                        max="1"
+                        step="0.1"
+                        value={state.scene.background.opacity}
+                        onChange={(e) =>
+                          setStateWithHistory('background_opacity', (prev) => ({
+                            ...prev,
+                            scene: {
+                              ...prev.scene,
+                              background: { ...prev.scene.background, opacity: parseFloat(e.target.value) }
+                            }
+                          }))
+                        }
+                        className="w-full accent-white bg-[#222] h-1 rounded-full appearance-none cursor-pointer"
+                      />
+                    </div>
+                    
+                    <div className="grid grid-cols-2 gap-2">
+                      <div>
+                        <label className="text-[10px] text-[#666]">X</label>
+                        <input
+                          type="number"
+                          value={state.scene.background.x}
+                          onChange={(e) =>
+                            setStateWithHistory('background_x', (prev) => ({
+                              ...prev,
+                              scene: {
+                                ...prev.scene,
+                                background: { ...prev.scene.background, x: parseFloat(e.target.value) || 0 }
+                              }
+                            }))
+                          }
+                          className="w-full px-2 py-1 bg-[#222] rounded text-[10px]"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-[10px] text-[#666]">Y</label>
+                        <input
+                          type="number"
+                          value={state.scene.background.y}
+                          onChange={(e) =>
+                            setStateWithHistory('background_y', (prev) => ({
+                              ...prev,
+                              scene: {
+                                ...prev.scene,
+                                background: { ...prev.scene.background, y: parseFloat(e.target.value) || 0 }
+                              }
+                            }))
+                          }
+                          className="w-full px-2 py-1 bg-[#222] rounded text-[10px]"
+                        />
+                      </div>
+                    </div>
+                    
+                    <div>
+                      <label className="text-[10px] text-[#666]">Scale</label>
+                      <input
+                        type="range"
+                        min="0.01"
+                        max="20"
+                        step="0.01"
+                        value={state.scene.background.scale}
+                        onChange={(e) =>
+                          setStateWithHistory('background_scale', (prev) => ({
+                            ...prev,
+                            scene: {
+                              ...prev.scene,
+                              background: { ...prev.scene.background, scale: parseFloat(e.target.value) }
+                            }
+                          }))
+                        }
+                        className="w-full accent-white bg-[#222] h-1 rounded-full appearance-none cursor-pointer"
+                      />
+                    </div>
+                    
+                    <select
+                      value={state.scene.background.fitMode}
+                      onChange={(e) =>
+                        setStateWithHistory('background_fit', (prev) => ({
+                          ...prev,
+                          scene: {
+                            ...prev.scene,
+                            background: { 
+                              ...prev.scene.background, 
+                              fitMode: e.target.value as 'contain' | 'cover' | 'fill' | 'none'
+                            }
+                          }
+                        }))
+                      }
+                      className="w-full px-2 py-1 bg-[#222] rounded text-[10px]"
+                    >
+                      <option value="contain">Contain</option>
+                      <option value="cover">Cover</option>
+                      <option value="fill">Fill</option>
+                      <option value="none">None</option>
+                    </select>
+                    
+                    <button
+                      onClick={() =>
+                        setStateWithHistory('clear_background', (prev) => ({
+                          ...prev,
+                          scene: {
+                            ...prev.scene,
+                            background: { ...prev.scene.background, src: null, visible: false }
+                          }
+                        }))
+                      }
+                      className="w-full py-1 bg-[#333] hover:bg-[#444] rounded text-[10px] transition-colors"
+                    >
+                      Clear
+                    </button>
+                  </div>
+                )}
+              </div>
+              
+              {/* Foreground Layer */}
+              <div className="mb-4">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-[10px] font-bold uppercase tracking-widest text-[#666]">Foreground</span>
+                  <button
+                    onClick={() => document.getElementById('fg-upload')?.click()}
+                    className="px-2 py-1 bg-[#222] hover:bg-[#333] rounded text-[10px] transition-colors"
+                  >
+                    Upload
+                  </button>
+                  <input
+                    id="fg-upload"
+                    type="file"
+                    accept="image/*"
+                    className="hidden"
+                    onChange={async (e) => {
+                      const file = e.target.files?.[0];
+                      if (!file) return;
+                      const url = URL.createObjectURL(file);
+                      setStateWithHistory('upload_foreground', (prev) => ({
+                        ...prev,
+                        scene: {
+                          ...prev.scene,
+                          foreground: { ...prev.scene.foreground, src: url, visible: true }
+                        }
+                      }));
+                    }}
+                  />
+                </div>
+                
+                {state.scene.foreground.src && (
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={state.scene.foreground.visible}
+                        onChange={(e) =>
+                          setStateWithHistory('toggle_foreground', (prev) => ({
+                            ...prev,
+                            scene: {
+                              ...prev.scene,
+                              foreground: { ...prev.scene.foreground, visible: e.target.checked }
+                            }
+                          }))
+                        }
+                        className="rounded"
+                      />
+                      <span className="text-[10px]">Visible</span>
+                    </div>
+                    
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-[10px]">
+                        <span>Opacity</span>
+                        <span>{(state.scene.foreground.opacity * 100).toFixed(0)}%</span>
+                      </div>
+                      <input
+                        type="range"
+                        min="0"
+                        max="1"
+                        step="0.1"
+                        value={state.scene.foreground.opacity}
+                        onChange={(e) =>
+                          setStateWithHistory('foreground_opacity', (prev) => ({
+                            ...prev,
+                            scene: {
+                              ...prev.scene,
+                              foreground: { ...prev.scene.foreground, opacity: parseFloat(e.target.value) }
+                            }
+                          }))
+                        }
+                        className="w-full accent-white bg-[#222] h-1 rounded-full appearance-none cursor-pointer"
+                      />
+                    </div>
+                    
+                    <div className="grid grid-cols-2 gap-2">
+                      <div>
+                        <label className="text-[10px] text-[#666]">X</label>
+                        <input
+                          type="number"
+                          value={state.scene.foreground.x}
+                          onChange={(e) =>
+                            setStateWithHistory('foreground_x', (prev) => ({
+                              ...prev,
+                              scene: {
+                                ...prev.scene,
+                                foreground: { ...prev.scene.foreground, x: parseFloat(e.target.value) || 0 }
+                              }
+                            }))
+                          }
+                          className="w-full px-2 py-1 bg-[#222] rounded text-[10px]"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-[10px] text-[#666]">Y</label>
+                        <input
+                          type="number"
+                          value={state.scene.foreground.y}
+                          onChange={(e) =>
+                            setStateWithHistory('foreground_y', (prev) => ({
+                              ...prev,
+                              scene: {
+                                ...prev.scene,
+                                foreground: { ...prev.scene.foreground, y: parseFloat(e.target.value) || 0 }
+                              }
+                            }))
+                          }
+                          className="w-full px-2 py-1 bg-[#222] rounded text-[10px]"
+                        />
+                      </div>
+                    </div>
+                    
+                    <div>
+                      <label className="text-[10px] text-[#666]">Scale</label>
+                      <input
+                        type="range"
+                        min="0.01"
+                        max="20"
+                        step="0.01"
+                        value={state.scene.foreground.scale}
+                        onChange={(e) =>
+                          setStateWithHistory('foreground_scale', (prev) => ({
+                            ...prev,
+                            scene: {
+                              ...prev.scene,
+                              foreground: { ...prev.scene.foreground, scale: parseFloat(e.target.value) }
+                            }
+                          }))
+                        }
+                        className="w-full accent-white bg-[#222] h-1 rounded-full appearance-none cursor-pointer"
+                      />
+                    </div>
+                    
+                    <select
+                      value={state.scene.foreground.fitMode}
+                      onChange={(e) =>
+                        setStateWithHistory('foreground_fit', (prev) => ({
+                          ...prev,
+                          scene: {
+                            ...prev.scene,
+                            foreground: { 
+                              ...prev.scene.foreground, 
+                              fitMode: e.target.value as 'contain' | 'cover' | 'fill' | 'none'
+                            }
+                          }
+                        }))
+                      }
+                      className="w-full px-2 py-1 bg-[#222] rounded text-[10px]"
+                    >
+                      <option value="contain">Contain</option>
+                      <option value="cover">Cover</option>
+                      <option value="fill">Fill</option>
+                      <option value="none">None</option>
+                    </select>
+                    
+                    <button
+                      onClick={() =>
+                        setStateWithHistory('clear_foreground', (prev) => ({
+                          ...prev,
+                          scene: {
+                            ...prev.scene,
+                            foreground: { ...prev.scene.foreground, src: null, visible: false }
+                          }
+                        }))
+                      }
+                      className="w-full py-1 bg-[#333] hover:bg-[#444] rounded text-[10px] transition-colors"
+                    >
+                      Clear
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {/* Joint Masks */}
+              <div className="mb-4">
+                {(() => {
+                  const mask = state.scene.jointMasks[maskJointId];
+                  if (!mask) {
+                    return (
+                      <div className="text-[10px] text-[#444]">
+                        Joint mask state missing (try Reset Engine).
+                      </div>
+                    );
+                  }
+
+                  const canPlace = Boolean(mask.src && mask.visible);
+
+                  return (
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between">
+                        <span className="text-[10px] font-bold uppercase tracking-widest text-[#666]">Joint Masks</span>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => setMaskEditArmed((v) => !v)}
+                            disabled={!canPlace}
+                            className={`px-2 py-1 rounded text-[10px] transition-colors ${
+                              canPlace
+                                ? maskEditArmed
+                                  ? 'bg-[#2b0057] hover:bg-[#3a007a]'
+                                  : 'bg-[#222] hover:bg-[#333]'
+                                : 'bg-[#181818] text-[#444] cursor-not-allowed'
+                            }`}
+                            title={canPlace ? 'Click + drag the mask once to place it' : 'Upload a mask and enable Visible to place'}
+                          >
+                            {maskEditArmed ? 'Placing…' : 'Place'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => jointMaskUploadInputRef.current?.click()}
+                            className="px-2 py-1 bg-[#222] hover:bg-[#333] rounded text-[10px] transition-colors"
+                          >
+                            Upload
+                          </button>
+                        </div>
+                      </div>
+
+                      <input
+                        ref={jointMaskUploadInputRef}
+                        type="file"
+                        accept="image/*"
+                        className="hidden"
+                        onChange={async (e) => {
+                          const file = e.target.files?.[0];
+                          e.target.value = '';
+                          if (!file) return;
+                          await uploadJointMaskFile(file, maskJointIdRef.current);
+                        }}
+                      />
+
+                      <div>
+                        <label className="text-[10px] text-[#666]">Joint</label>
+                        <select
+                          value={maskJointId}
+                          onChange={(e) => setMaskJointId(e.target.value)}
+                          className="w-full px-2 py-1 bg-[#222] rounded text-[10px]"
+                        >
+                          {Object.keys(state.joints).map((id) => (
+                            <option key={id} value={id}>
+                              {state.joints[id].label || id}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+
+                      <div className="flex items-center justify-between gap-2">
+                        <label className="flex items-center gap-2 text-[10px]">
+                          <input
+                            type="checkbox"
+                            checked={mask.visible}
+                            onChange={(e) =>
+                              setStateWithHistory(`mask_visible:${maskJointId}`, (prev) => ({
+                                ...prev,
+                                scene: {
+                                  ...prev.scene,
+                                  jointMasks: {
+                                    ...prev.scene.jointMasks,
+                                    [maskJointId]: { ...prev.scene.jointMasks[maskJointId], visible: e.target.checked },
+                                  },
+                                },
+                              }))
+                            }
+                            className="rounded"
+                          />
+                          Visible
+                        </label>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setStateWithHistory(`mask_clear:${maskJointId}`, (prev) => ({
+                              ...prev,
+                              scene: {
+                                ...prev.scene,
+                                jointMasks: {
+                                  ...prev.scene.jointMasks,
+                                  [maskJointId]: {
+                                    ...prev.scene.jointMasks[maskJointId],
+                                    src: null,
+                                    visible: false,
+                                    opacity: 1,
+                                    scale: 1,
+                                    offsetX: 0,
+                                    offsetY: 0,
+                                  },
+                                },
+                              },
+                            }))
+                          }
+                          className="px-2 py-1 bg-[#333] hover:bg-[#444] rounded text-[10px] transition-colors"
+                        >
+                          Clear
+                        </button>
+                      </div>
+
+                      <div className="space-y-1">
+                        <div className="flex justify-between text-[10px]">
+                          <span>Opacity</span>
+                          <span>{(mask.opacity * 100).toFixed(0)}%</span>
+                        </div>
+                        <input
+                          type="range"
+                          min="0"
+                          max="1"
+                          step="0.05"
+                          value={mask.opacity}
+                          onChange={(e) =>
+                            setStateWithHistory(`mask_opacity:${maskJointId}`, (prev) => ({
+                              ...prev,
+                              scene: {
+                                ...prev.scene,
+                                jointMasks: {
+                                  ...prev.scene.jointMasks,
+                                  [maskJointId]: { ...prev.scene.jointMasks[maskJointId], opacity: parseFloat(e.target.value) },
+                                },
+                              },
+                            }))
+                          }
+                          className="w-full accent-white bg-[#222] h-1 rounded-full appearance-none cursor-pointer"
+                        />
+                      </div>
+
+                      <div className="space-y-1">
+                        <div className="flex justify-between text-[10px]">
+                          <span>Scale</span>
+                          <span>{mask.scale.toFixed(2)}×</span>
+                        </div>
+                        <input
+                          type="range"
+                          min="0.01"
+                          max="20"
+                          step="0.01"
+                          value={mask.scale}
+                          onChange={(e) =>
+                            setStateWithHistory(`mask_scale:${maskJointId}`, (prev) => ({
+                              ...prev,
+                              scene: {
+                                ...prev.scene,
+                                jointMasks: {
+                                  ...prev.scene.jointMasks,
+                                  [maskJointId]: { ...prev.scene.jointMasks[maskJointId], scale: parseFloat(e.target.value) },
+                                },
+                              },
+                            }))
+                          }
+                          className="w-full accent-white bg-[#222] h-1 rounded-full appearance-none cursor-pointer"
+                        />
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-2">
+                        <div>
+                          <label className="text-[10px] text-[#666]">Offset X</label>
+                          <input
+                            type="number"
+                            value={mask.offsetX}
+                            onChange={(e) =>
+                              setStateWithHistory(`mask_offset_x:${maskJointId}`, (prev) => ({
+                                ...prev,
+                                scene: {
+                                  ...prev.scene,
+                                  jointMasks: {
+                                    ...prev.scene.jointMasks,
+                                    [maskJointId]: { ...prev.scene.jointMasks[maskJointId], offsetX: parseFloat(e.target.value) || 0 },
+                                  },
+                                },
+                              }))
+                            }
+                            className="w-full px-2 py-1 bg-[#222] rounded text-[10px]"
+                          />
+                        </div>
+                        <div>
+                          <label className="text-[10px] text-[#666]">Offset Y</label>
+                          <input
+                            type="number"
+                            value={mask.offsetY}
+                            onChange={(e) =>
+                              setStateWithHistory(`mask_offset_y:${maskJointId}`, (prev) => ({
+                                ...prev,
+                                scene: {
+                                  ...prev.scene,
+                                  jointMasks: {
+                                    ...prev.scene.jointMasks,
+                                    [maskJointId]: { ...prev.scene.jointMasks[maskJointId], offsetY: parseFloat(e.target.value) || 0 },
+                                  },
+                                },
+                              }))
+                            }
+                            className="w-full px-2 py-1 bg-[#222] rounded text-[10px]"
+                          />
+                        </div>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setStateWithHistory(`mask_center:${maskJointId}`, (prev) => ({
+                            ...prev,
+                            scene: {
+                              ...prev.scene,
+                              jointMasks: {
+                                ...prev.scene.jointMasks,
+                                [maskJointId]: { ...prev.scene.jointMasks[maskJointId], offsetX: 0, offsetY: 0 },
+                              },
+                            },
+                          }))
+                        }
+                        className="w-full py-1 bg-[#222] hover:bg-[#333] rounded text-[10px] transition-colors"
+                      >
+                        Center on joint
+                      </button>
+                    </div>
+                  );
+                })()}
+              </div>
+            </section>
+
+	            <section>
+	              <div className="flex items-center gap-2 mb-4 text-[#666]">
+	                <Layers size={14} />
+	                <h2 className="text-[10px] font-bold uppercase tracking-widest">Joint Hierarchy</h2>
+	              </div>
+              {(() => {
+                const selected = selectedJointId ? state.joints[selectedJointId] : null;
+                if (!selected || !selected.parent) {
+                  return (
+                    <div className="mb-3 text-[10px] text-[#444]">
+                      Select a joint to edit rotation.
+                    </div>
+                  );
+                }
+
+                const angleDeg = toAngleDeg(selected.previewOffset);
+                const actionId = `joint_angle:${selected.id}`;
+
+                return (
+                  <div className="mb-3 p-3 rounded-xl bg-white/5 border border-white/10">
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="text-[10px] font-bold uppercase tracking-widest text-[#666]">
+                        {selected.label} Angle
+                      </div>
+                      <div className="font-mono text-xs text-white">{angleDeg.toFixed(1)}°</div>
+                    </div>
+                    <input
+                      type="range"
+                      min="-180"
+                      max="180"
+                      step="1"
+	                      value={angleDeg}
+	                      onPointerDown={() => {
+                          setTimelinePlaying(false);
+                          historyCtrlRef.current.beginAction(actionId, state);
+                        }}
+                      onPointerUp={() =>
+                        setState((prev) => {
+                          const changed = historyCtrlRef.current.commitAction(prev);
+                          return changed ? { ...prev } : prev;
+                        })
+                      }
+                      onPointerCancel={() =>
+                        setState((prev) => {
+                          const changed = historyCtrlRef.current.commitAction(prev);
+                          return changed ? { ...prev } : prev;
+                        })
+                      }
+                      onChange={(e) => setJointAngleDeg(selected.id, parseFloat(e.target.value))}
+                      className="w-full accent-white bg-[#222] h-1 rounded-full appearance-none cursor-pointer"
+                    />
+                  </div>
+                );
+              })()}
+	              <div className="max-h-[300px] overflow-y-auto pr-2 space-y-1">
+	                {(Object.values(state.joints) as Joint[]).map((joint: Joint) => (
+	                  <div 
+	                    key={joint.id}
+                      onClick={() => setSelectedJointId(joint.id)}
+	                    className={`group flex items-center justify-between p-2 rounded-md transition-colors cursor-pointer ${
+                        draggingId === joint.id
+                          ? 'bg-white/10'
+                          : selectedJointId === joint.id
+                            ? 'bg-white/5'
+                            : 'hover:bg-white/5'
+                      }`}
+	                  >
+	                    <div className="flex items-center gap-2">
+	                      <div className={`w-1.5 h-1.5 rounded-full ${joint.isEndEffector ? 'bg-white' : 'bg-[#444]'}`} />
+	                      <span className="text-xs font-medium">{joint.label}</span>
+	                    </div>
+	                    <button 
+	                      onClick={(e) => {
+                          e.stopPropagation();
+                          togglePin(joint.id);
+                        }}
+	                      className={`p-1 rounded transition-colors ${state.activePins.includes(joint.id) ? 'text-[#ff0066]' : 'text-[#444] group-hover:text-[#888]'}`}
+	                    >
+	                      <Anchor size={12} />
+	                    </button>
+	                  </div>
+	                ))}
+	              </div>
+		            </section>
+            </div>
+          </div>
+
+          <div className="p-6 pt-0">
+            <button 
+              onClick={resetSkeleton}
+              className="w-full flex items-center justify-center gap-2 py-3 bg-[#222] hover:bg-[#333] rounded-xl text-xs font-bold transition-all active:scale-95"
+            >
+              <RotateCcw size={14} />
+              RESET ENGINE
+            </button>
+          </div>
+        </div>
+      </motion.aside>
+
+      {/* Main Viewport */}
+      <main className="flex-1 relative flex flex-col overflow-hidden">
+        {/* Toggle Sidebar Button */}
+        <button 
+          onClick={() => setSidebarOpen(!sidebarOpen)}
+          className="absolute top-6 left-6 z-10 p-2 bg-[#121212] border border-[#222] rounded-lg hover:bg-[#222] transition-colors"
+        >
+          {sidebarOpen ? <ChevronLeft size={16} /> : <ChevronRight size={16} />}
+        </button>
+
+        {/* Canvas */}
+        <div 
+          ref={canvasRef}
+          className={`flex-1 cursor-crosshair relative ${gridRingsBg ? 'grid-rings-viewport' : ''}`}
+          onMouseDown={() => setSelectedJointId(null)}
+          onMouseMove={handleMouseMove}
+          onMouseUp={handleMouseUp}
+          onMouseLeave={handleMouseUp}
+          onDragOver={(e) => {
+            if (e.dataTransfer.types.includes(DND_WIDGET_MIME)) e.preventDefault();
+          }}
+          onDrop={(e) => {
+            const payload = e.dataTransfer.getData(DND_WIDGET_MIME) as WidgetKind;
+            if (payload !== 'joint_masks' && payload !== 'console') return;
+            e.preventDefault();
+            spawnFloatingWidget(payload, e.clientX, e.clientY);
+          }}
+        >
+          {gridRingsBg && gridOverlayTransform && (() => {
+            const {
+              characterCenterX,
+              characterCenterY,
+              headLenPx,
+              vmin,
+            } = gridOverlayTransform;
+
+            const major = Math.max(1, headLenPx);
+            const ringCount = major > 0 ? Math.floor((vmin / 2) / major) : 0;
+
+            return (
+              <div className="absolute inset-0 pointer-events-none z-0 overflow-hidden" aria-hidden="true">
+                <svg width={canvasSize.width} height={canvasSize.height} className="absolute inset-0">
+                  <defs>
+                    <pattern
+                      id="grid-major"
+                      width={major}
+                      height={major}
+                      patternUnits="userSpaceOnUse"
+                      x={characterCenterX}
+                      y={characterCenterY}
+                    >
+                      <path d={`M ${major} 0 L 0 0 0 ${major}`} fill="none" stroke="#8B008B" strokeWidth="2" opacity="0.35" />
+                    </pattern>
+                  </defs>
+
+                  {/* Square grid across whole window */}
+                  <rect x="0" y="0" width="100%" height="100%" fill="url(#grid-major)" />
+
+                  {/* Centerlines */}
+                  <line x1="0" y1={characterCenterY} x2={canvasSize.width} y2={characterCenterY} stroke="#006400" strokeWidth="2" opacity="0.85" />
+                  <line x1={characterCenterX} y1="0" x2={characterCenterX} y2={canvasSize.height} stroke="#006400" strokeWidth="2" opacity="0.85" />
+
+                  {/* Rings: spaced one head length apart, always inside viewing window */}
+                  {Array.from({ length: ringCount + 1 }).map((_, idx) => {
+                    const r = idx * major;
+                    if (r <= 0) return null;
+                    return (
+                      <circle
+                        key={`ring-${idx}`}
+                        cx={characterCenterX}
+                        cy={characterCenterY}
+                        r={r}
+                        fill="none"
+                        stroke="#006400"
+                        strokeWidth={idx % 2 === 0 ? 2 : 1}
+                        opacity={0.75}
+                      />
+                    );
+                  })}
+                </svg>
+              </div>
+            );
+          })()}
+
+          <svg
+            ref={svgRef}
+            width={canvasSize.width}
+            height={canvasSize.height}
+            viewBox={`0 0 ${canvasSize.width} ${canvasSize.height}`}
+            className={`w-full h-full skeleton-canvas ${state.viewMode === 'noir' ? 'grayscale contrast-125' : ''}`}
+          >
+            {/* Grid */}
+            <defs>
+              <pattern 
+                id="grid" 
+                width={state.viewMode === '8-bitruvius' ? 80 : state.viewMode === '16-bitruvius' ? 40 : state.viewMode === '32-bitruvius' ? 20 : 40} 
+                height={state.viewMode === '8-bitruvius' ? 80 : state.viewMode === '16-bitruvius' ? 40 : state.viewMode === '32-bitruvius' ? 20 : 40} 
+                patternUnits="userSpaceOnUse"
+              >
+                <path 
+                  d={`M ${state.viewMode === '8-bitruvius' ? 80 : state.viewMode === '16-bitruvius' ? 40 : state.viewMode === '32-bitruvius' ? 20 : 40} 0 L 0 0 0 ${state.viewMode === '8-bitruvius' ? 80 : state.viewMode === '16-bitruvius' ? 40 : state.viewMode === '32-bitruvius' ? 20 : 40}`} 
+                  fill="none" 
+                  stroke={state.viewMode === 'noir' ? "#444" : "#222"} 
+                  strokeWidth="0.5" 
+                />
+              </pattern>
+            </defs>
+            <rect width="100%" height="100%" fill={gridRingsBg ? 'transparent' : '#0a0a0a'} />
+            {showEditorGrid && <rect width="100%" height="100%" fill="url(#grid)" opacity={gridRingsBg ? 0.25 : 1} />}
+            
+            {/* Reference Layers */}
+	            {state.scene.background.src && state.scene.background.visible && (
+	              <image
+	                href={state.scene.background.src}
+	                x={state.scene.background.x}
+	                y={state.scene.background.y}
+	                width={canvasSize.width * state.scene.background.scale}
+	                height={canvasSize.height * state.scene.background.scale}
+                preserveAspectRatio={
+                  state.scene.background.fitMode === 'none' ? 'none' :
+                  state.scene.background.fitMode === 'fill' ? 'none' :
+                  state.scene.background.fitMode === 'cover' ? 'xMidYMid slice' :
+                  'xMidYMid meet'
+	                }
+	                opacity={state.scene.background.opacity}
+	              />
+	            )}
+            
+	            {/* Floor Plane */}
+	            <line 
+	              x1="0" y1={canvasSize.height / 2 + 16 * 20} 
+	              x2={canvasSize.width} y2={canvasSize.height / 2 + 16 * 20} 
+	              stroke="#333" strokeWidth="1" strokeDasharray="10 5" 
+	            />
+
+              {/* Onion Skin (Timeline Ghosts) */}
+              {state.timeline.enabled &&
+                state.timeline.onionSkin.enabled &&
+                state.timeline.clip.keyframes.length > 0 &&
+                (() => {
+                  const scale = 20;
+                  const centerX = canvasSize.width / 2;
+                  const centerY = canvasSize.height / 2;
+
+                  const ghostFrames = getGhostFrames({
+                    frame: timelineFrame,
+                    frameCount: state.timeline.clip.frameCount,
+                    past: state.timeline.onionSkin.past,
+                    future: state.timeline.onionSkin.future,
+                  });
+
+                  const autoBones: Array<{ from: string; to: string }> = [];
+                  for (const id of Object.keys(INITIAL_JOINTS)) {
+                    const joint = INITIAL_JOINTS[id];
+                    if (!joint.parent) continue;
+                    if (id.includes('nipple')) continue;
+                    const exists = CONNECTIONS.some(
+                      (c) => (c.from === joint.parent && c.to === id) || (c.from === id && c.to === joint.parent),
+                    );
+                    if (exists) continue;
+                    autoBones.push({ from: joint.parent, to: id });
+                  }
+
+                  const lines = [...CONNECTIONS.map((c) => ({ from: c.from, to: c.to })), ...autoBones];
+
+                  return (
+                    <g aria-hidden="true">
+                      {ghostFrames.map((g) => {
+                        const pose = sampleClipPose(state.timeline.clip, g.frame, INITIAL_JOINTS, {
+                          stretchEnabled: state.stretchEnabled,
+                        });
+                        if (!pose) return null;
+
+                        const color = g.direction === 'past' ? 'rgba(255, 255, 255, 0.65)' : 'rgba(255, 255, 255, 0.45)';
+
+                        return (
+                          <g key={`onion-${g.direction}-${g.frame}`} opacity={g.opacity}>
+                            {lines.map((ln) => {
+                              const a = getWorldPositionFromOffsets(ln.from, pose.joints, INITIAL_JOINTS);
+                              const b = getWorldPositionFromOffsets(ln.to, pose.joints, INITIAL_JOINTS);
+                              const x1 = a.x * scale + centerX;
+                              const y1 = a.y * scale + centerY;
+                              const x2 = b.x * scale + centerX;
+                              const y2 = b.y * scale + centerY;
+                              if (isNaN(x1) || isNaN(y1) || isNaN(x2) || isNaN(y2)) return null;
+                              return (
+                                <line
+                                  key={`onion-line-${g.frame}-${ln.from}-${ln.to}`}
+                                  x1={x1}
+                                  y1={y1}
+                                  x2={x2}
+                                  y2={y2}
+                                  stroke={color}
+                                  strokeWidth={2}
+                                />
+                              );
+                            })}
+                            {Object.keys(INITIAL_JOINTS).map((id) => {
+                              const p = getWorldPositionFromOffsets(id, pose.joints, INITIAL_JOINTS);
+                              const x = p.x * scale + centerX;
+                              const y = p.y * scale + centerY;
+                              if (isNaN(x) || isNaN(y)) return null;
+                              return <circle key={`onion-joint-${g.frame}-${id}`} cx={x} cy={y} r={2} fill={color} />;
+                            })}
+                          </g>
+                        );
+                      })}
+                    </g>
+                  );
+                })()}
+
+	            {/* Bones & Connections */}
+	            {CONNECTIONS.map(renderConnection)}
+            
+            {/* Automatic Hierarchy Bones (Restoring missing bones) */}
+            {Object.keys(state.joints).map(id => {
+              const joint = state.joints[id];
+              if (!joint.parent) return null;
+              // Skip nipples for automatic bones
+              if (id.includes('nipple')) return null;
+              // Check if this connection is already explicitly defined
+              const exists = CONNECTIONS.some(c => 
+                (c.from === joint.parent && c.to === id) || 
+                (c.from === id && c.to === joint.parent)
+              );
+              if (exists) return null;
+              return renderConnection({ from: joint.parent, to: id, type: 'bone' });
+            })}
+
+            {/* Ghost Clone Joints */}
+            {draggingId && Object.keys(state.joints).map(id => {
+              const pos = getWorldPosition(id, state.joints, INITIAL_JOINTS, 'preview');
+              const scale = 20;
+              const centerX = canvasSize.width / 2;
+              const centerY = canvasSize.height / 2;
+              const x = pos.x * scale + centerX;
+              const y = pos.y * scale + centerY;
+              if (isNaN(x) || isNaN(y)) return null;
+              return (
+                <circle 
+                  key={`ghost-joint-${id}`} 
+                  cx={x} cy={y} r="2" 
+                  fill="var(--ghost)" 
+                  style={{ opacity: 0.5 }} 
+                />
+              );
+            })}
+            
+	            {/* Joint Masks */}
+	            {(() => {
+	              if (!canvasSize.width || !canvasSize.height) return null;
+	              const pxPerUnit = 20;
+	              const centerX = canvasSize.width / 2;
+	              const centerY = canvasSize.height / 2;
+	              const headPos = getWorldPosition('head', state.joints, INITIAL_JOINTS);
+	              const craniumPos = getWorldPosition('cranium', state.joints, INITIAL_JOINTS);
+	              const neckBasePos = getWorldPosition('neck_base', state.joints, INITIAL_JOINTS);
+	              const headLenUnits = Math.hypot(headPos.x - craniumPos.x, headPos.y - craniumPos.y) * 2;
+	              const headLenPx = Math.max(1, headLenUnits * pxPerUnit);
+	              const neckSpanUnits = Math.hypot(headPos.x - neckBasePos.x, headPos.y - neckBasePos.y);
+	              const neckSpanPx = Math.max(1, neckSpanUnits * pxPerUnit);
+
+	              return Object.entries(state.scene.jointMasks).map(([jointId, mask]) => {
+	                if (!mask?.src || !mask.visible) return null;
+	                if (!(jointId in state.joints)) return null;
+
+	                const jointPos = getWorldPosition(jointId, state.joints, INITIAL_JOINTS);
+	                const jointX = jointPos.x * pxPerUnit + centerX;
+	                const jointY = jointPos.y * pxPerUnit + centerY;
+	                if (isNaN(jointX) || isNaN(jointY)) return null;
+
+	                const requestedSize = headLenPx * Math.max(0.01, mask.scale);
+	                const autoMaxSize = neckSpanPx;
+	                const size = requestedSize > autoMaxSize * 1.05 ? autoMaxSize : requestedSize;
+	                const x = jointX - size / 2 + (mask.offsetX || 0);
+	                const y = jointY - size / 2 + (mask.offsetY || 0);
+
+	                return (
+	                  <image
+                    key={`joint-mask:${jointId}`}
+                    href={mask.src}
+                    x={x}
+                    y={y}
+                    width={size}
+                    height={size}
+                    opacity={mask.opacity}
+                    onMouseDown={handleMaskMouseDown(jointId)}
+                    style={{
+                      pointerEvents: maskEditArmed ? 'auto' : 'none',
+                      cursor: maskEditArmed ? 'grab' : 'default',
+                    }}
+                  />
+                );
+              });
+            })()}
+            
+            {/* Joints */}
+            {Object.keys(state.joints).map(renderJoint)}
+            
+            {/* Foreground Reference Layer */}
+	            {state.scene.foreground.src && state.scene.foreground.visible && (
+	              <image
+	                href={state.scene.foreground.src}
+	                x={state.scene.foreground.x}
+	                y={state.scene.foreground.y}
+	                width={canvasSize.width * state.scene.foreground.scale}
+	                height={canvasSize.height * state.scene.foreground.scale}
+                preserveAspectRatio={
+                  state.scene.foreground.fitMode === 'none' ? 'none' :
+                  state.scene.foreground.fitMode === 'fill' ? 'none' :
+                  state.scene.foreground.fitMode === 'cover' ? 'xMidYMid slice' :
+                  'xMidYMid meet'
+	                }
+	                opacity={state.scene.foreground.opacity}
+	              />
+	            )}
+          </svg>
+
+          {/* Floating Widgets */}
+          {floatingWidgets.map((widget) => {
+            const title = widget.kind === 'console' ? 'Console' : 'Joint Masks';
+            const headerH = 34;
+            return (
+              <div
+                key={widget.id}
+                className="absolute z-30 pointer-events-auto"
+                style={{ left: widget.x, top: widget.y, width: widget.w }}
+                onMouseDown={(e) => e.stopPropagation()}
+              >
+                <div
+                  className="bg-[#121212]/90 backdrop-blur-md border border-[#222] rounded-xl shadow-xl overflow-hidden"
+                  style={{ height: widget.minimized ? headerH : widget.h }}
+                >
+                  <div
+                    className="h-[34px] px-3 flex items-center justify-between cursor-move select-none"
+                    onMouseDown={(e) => {
+                      e.stopPropagation();
+                      setWidgetDragging({
+                        id: widget.id,
+                        startClientX: e.clientX,
+                        startClientY: e.clientY,
+                        startX: widget.x,
+                        startY: widget.y,
+                      });
+                    }}
+                  >
+                    <div className="flex items-center gap-2">
+                      {widget.kind === 'console' ? (
+                        <Terminal size={14} className="text-[#666]" />
+                      ) : (
+                        <Anchor size={14} className="text-[#666]" />
+                      )}
+                      <div className="text-[10px] font-bold uppercase tracking-widest text-[#666]">{title}</div>
+                    </div>
+                    <div className="flex items-center gap-1">
+                      <button
+                        type="button"
+                        onMouseDown={(e) => e.stopPropagation()}
+                        onClick={() =>
+                          setFloatingWidgets((prev) =>
+                            prev.map((w) => (w.id === widget.id ? { ...w, minimized: !w.minimized } : w)),
+                          )
+                        }
+                        className="p-1 rounded hover:bg-white/10 text-[#888]"
+                        title={widget.minimized ? 'Restore' : 'Minimize'}
+                      >
+                        <Minus size={14} />
+                      </button>
+                      <button
+                        type="button"
+                        onMouseDown={(e) => e.stopPropagation()}
+                        onClick={() => setFloatingWidgets((prev) => prev.filter((w) => w.id !== widget.id))}
+                        className="p-1 rounded hover:bg-white/10 text-[#888]"
+                        title="Close"
+                      >
+                        <X size={14} />
+                      </button>
+                    </div>
+                  </div>
+
+                  {!widget.minimized && (
+                    <div className="p-3 overflow-auto" style={{ height: widget.h - headerH }}>
+                      {widget.kind === 'console' ? (
+                        <div className="space-y-3">
+                          <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-2">
+                              {(['info', 'warning', 'error', 'success'] as const).map((lvl) => {
+                                const active = activeLogLevels.has(lvl);
+                                const color =
+                                  lvl === 'error'
+                                    ? 'text-red-400'
+                                    : lvl === 'warning'
+                                      ? 'text-yellow-300'
+                                      : lvl === 'success'
+                                        ? 'text-green-400'
+                                        : 'text-blue-300';
+                                return (
+                                  <button
+                                    key={lvl}
+                                    type="button"
+                                    onClick={() =>
+                                      setActiveLogLevels((prev) => {
+                                        const next = new Set(prev);
+                                        if (next.has(lvl)) next.delete(lvl);
+                                        else next.add(lvl);
+                                        return next;
+                                      })
+                                    }
+                                    className={`px-2 py-1 rounded text-[10px] font-bold uppercase tracking-widest border ${
+                                      active ? 'bg-[#222] border-[#333]' : 'bg-transparent border-[#222] opacity-60'
+                                    } ${color}`}
+                                  >
+                                    {lvl}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => setConsoleLogs([])}
+                              className="px-2 py-1 rounded text-[10px] font-bold uppercase tracking-widest bg-[#222] hover:bg-[#333]"
+                            >
+                              Clear
+                            </button>
+                          </div>
+
+                          <div className="space-y-1 font-mono text-[11px]">
+                            {filteredConsoleLogs.slice(-120).map((log) => (
+                              <div key={log.id} className="flex gap-2 items-start">
+                                <span className="text-[#555] shrink-0">
+                                  {new Date(log.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                                </span>
+                                <span className="text-[#666] shrink-0">{log.level.toUpperCase()}</span>
+                                <span className="text-white break-words">{log.message}</span>
+                              </div>
+                            ))}
+                            {filteredConsoleLogs.length === 0 && (
+                              <div className="text-[#444]">No logs (filters may be hiding everything).</div>
+                            )}
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="text-[10px] text-[#666]">
+                          Use the left sidebar’s <span className="text-white">Scene → Joint Masks</span> controls (this widget is a
+                          quick launcher).
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+
+          {/* HUD Overlay */}
+          <div className="absolute bottom-8 left-8 flex gap-4 pointer-events-none">
+            <div className="bg-[#121212]/80 backdrop-blur-md border border-[#222] p-4 rounded-2xl">
+              <p className="text-[10px] text-[#666] uppercase font-bold mb-2 tracking-widest">State Vector</p>
+              <div className="grid grid-cols-2 gap-x-6 gap-y-1 font-mono text-xs">
+                <span className="text-[#444]">X_COORD</span>
+                <span className="text-white">{(state.joints.sacrum.currentOffset.x).toFixed(3)}</span>
+                <span className="text-[#444]">Y_COORD</span>
+                <span className="text-white">{(state.joints.sacrum.currentOffset.y).toFixed(3)}</span>
+                <span className="text-[#444]">PINS_ACT</span>
+                <span className="text-white">{state.activePins.length}</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="absolute top-8 right-8 flex gap-2">
+             <div className="bg-[#121212]/80 backdrop-blur-md border border-[#222] px-4 py-2 rounded-full flex items-center gap-3">
+                <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
+                <span className="text-[10px] font-bold tracking-widest uppercase">Live Engine</span>
+             </div>
+	          </div>
+	        </div>
+
+          {state.timeline.enabled && (() => {
+            const frameCount = Math.max(2, Math.floor(state.timeline.clip.frameCount));
+            const fps = Math.max(1, Math.floor(state.timeline.clip.fps));
+            const hasKeyframe = state.timeline.clip.keyframes.some((k) => k.frame === timelineFrame);
+
+            return (
+              <div className="shrink-0 bg-[#121212] border-t border-[#222] px-6 py-4">
+                <div className="flex items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (timelinePlaying) {
+                        setTimelinePlaying(false);
+                        return;
+                      }
+                      timelineFrameRef.current = timelineFrame;
+                      setTimelinePlaying(true);
+                    }}
+                    className="px-3 py-2 rounded-lg bg-[#222] hover:bg-[#333] text-[10px] font-bold uppercase tracking-widest transition-all"
+                  >
+                    {timelinePlaying ? 'Pause' : 'Play'}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={setKeyframeHere}
+                    className="px-3 py-2 rounded-lg bg-[#222] hover:bg-[#333] text-[10px] font-bold uppercase tracking-widest transition-all"
+                  >
+                    {hasKeyframe ? 'Update Key' : 'Set Key'}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={deleteKeyframeHere}
+                    disabled={!hasKeyframe}
+                    className={`px-3 py-2 rounded-lg text-[10px] font-bold uppercase tracking-widest transition-all ${
+                      hasKeyframe ? 'bg-[#222] hover:bg-[#333]' : 'bg-[#181818] text-[#444] cursor-not-allowed'
+                    }`}
+                  >
+                    Delete Key
+                  </button>
+
+                  <div className="ml-auto flex items-center gap-4">
+                    <div className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-[#666]">
+                      <span>FPS</span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={60}
+                        value={fps}
+                        onChange={(e) => {
+                          setTimelinePlaying(false);
+                          const next = clamp(parseInt(e.target.value || '0', 10), 1, 60);
+                          setStateWithHistory('timeline_set_fps', (prev) => ({
+                            ...prev,
+                            timeline: {
+                              ...prev.timeline,
+                              clip: { ...prev.timeline.clip, fps: next },
+                            },
+                          }));
+                        }}
+                        className="w-16 px-2 py-1 rounded-md bg-[#0a0a0a] border border-[#222] text-white font-mono text-xs"
+                      />
+                    </div>
+
+                    <div className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-[#666]">
+                      <span>Frames</span>
+                      <input
+                        type="number"
+                        min={2}
+                        max={600}
+                        value={frameCount}
+                        onChange={(e) => {
+                          setTimelinePlaying(false);
+                          const next = clamp(parseInt(e.target.value || '0', 10), 2, 600);
+                          setStateWithHistory('timeline_set_frame_count', (prev) => ({
+                            ...prev,
+                            timeline: {
+                              ...prev.timeline,
+                              clip: {
+                                ...prev.timeline.clip,
+                                frameCount: next,
+                                keyframes: prev.timeline.clip.keyframes.filter((k) => k.frame < next),
+                              },
+                            },
+                          }));
+                          setTimelineFrame((f) => {
+                            const clamped = clamp(f, 0, next - 1);
+                            timelineFrameRef.current = clamped;
+                            return clamped;
+                          });
+                        }}
+                        className="w-20 px-2 py-1 rounded-md bg-[#0a0a0a] border border-[#222] text-white font-mono text-xs"
+                      />
+                    </div>
+
+                    <div className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-[#666]">
+                      <span>Easing</span>
+                      <select
+                        value={state.timeline.clip.easing}
+                        onChange={(e) => {
+                          setTimelinePlaying(false);
+                          const next = e.target.value === 'easeInOut' ? 'easeInOut' : 'linear';
+                          setStateWithHistory('timeline_set_easing', (prev) => ({
+                            ...prev,
+                            timeline: {
+                              ...prev.timeline,
+                              clip: { ...prev.timeline.clip, easing: next },
+                            },
+                          }));
+                        }}
+                        className="px-2 py-1 rounded-md bg-[#0a0a0a] border border-[#222] text-white text-xs"
+                      >
+                        <option value="linear">Linear</option>
+                        <option value="easeInOut">EaseInOut</option>
+                      </select>
+                    </div>
+
+                    <label className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-[#666] select-none">
+                      <input
+                        type="checkbox"
+                        checked={state.timeline.onionSkin.enabled}
+                        onChange={() => {
+                          setTimelinePlaying(false);
+                          setStateWithHistory('toggle_onion_skin', (prev) => ({
+                            ...prev,
+                            timeline: {
+                              ...prev.timeline,
+                              onionSkin: { ...prev.timeline.onionSkin, enabled: !prev.timeline.onionSkin.enabled },
+                            },
+                          }));
+                        }}
+                        className="accent-white"
+                      />
+                      Onion
+                    </label>
+                  </div>
+                </div>
+
+                <div className="mt-3 flex items-center gap-3">
+                  <div className="w-28 font-mono text-xs text-[#666]">
+                    {timelineFrame}/{frameCount - 1}
+                  </div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={frameCount - 1}
+                    step={1}
+                    value={timelineFrame}
+                    onPointerDown={() => {
+                      setTimelinePlaying(false);
+                      historyCtrlRef.current.beginAction('timeline_scrub', state);
+                    }}
+                    onPointerUp={() =>
+                      setState((prev) => {
+                        const changed = historyCtrlRef.current.commitAction(prev);
+                        return changed ? { ...prev } : prev;
+                      })
+                    }
+                    onPointerCancel={() =>
+                      setState((prev) => {
+                        const changed = historyCtrlRef.current.commitAction(prev);
+                        return changed ? { ...prev } : prev;
+                      })
+                    }
+                    onChange={(e) => applyTimelineFrame(parseInt(e.target.value, 10))}
+                    className="flex-1 accent-white bg-[#222] h-1 rounded-full appearance-none cursor-pointer"
+                  />
+                  <div className="w-24 text-[10px] font-bold uppercase tracking-widest text-[#666] text-right">
+                    Keys: {state.timeline.clip.keyframes.length}
+                  </div>
+                </div>
+
+                {state.timeline.onionSkin.enabled && (
+                  <div className="mt-3 flex items-center gap-4 text-[10px] font-bold uppercase tracking-widest text-[#666]">
+                    <div className="flex items-center gap-2">
+                      <span>Past</span>
+                      <input
+                        type="number"
+                        min={0}
+                        max={12}
+                        value={state.timeline.onionSkin.past}
+                        onChange={(e) => {
+                          setTimelinePlaying(false);
+                          const next = clamp(parseInt(e.target.value || '0', 10), 0, 12);
+                          setStateWithHistory('onion_past', (prev) => ({
+                            ...prev,
+                            timeline: {
+                              ...prev.timeline,
+                              onionSkin: { ...prev.timeline.onionSkin, past: next },
+                            },
+                          }));
+                        }}
+                        className="w-16 px-2 py-1 rounded-md bg-[#0a0a0a] border border-[#222] text-white font-mono text-xs"
+                      />
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span>Future</span>
+                      <input
+                        type="number"
+                        min={0}
+                        max={12}
+                        value={state.timeline.onionSkin.future}
+                        onChange={(e) => {
+                          setTimelinePlaying(false);
+                          const next = clamp(parseInt(e.target.value || '0', 10), 0, 12);
+                          setStateWithHistory('onion_future', (prev) => ({
+                            ...prev,
+                            timeline: {
+                              ...prev.timeline,
+                              onionSkin: { ...prev.timeline.onionSkin, future: next },
+                            },
+                          }));
+                        }}
+                        className="w-16 px-2 py-1 rounded-md bg-[#0a0a0a] border border-[#222] text-white font-mono text-xs"
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })()}
+	      </main>
+	    </div>
+	  );
+	}
+
+  function Toggle({ label, active, onClick }: { label: string, active: boolean, onClick: () => void }) {
+  return (
+    <button 
+      onClick={onClick}
+      className={`w-full flex items-center justify-between p-3 rounded-xl border transition-all ${active ? 'bg-white text-black border-white' : 'bg-transparent text-[#666] border-[#222] hover:border-[#444]'}`}
+    >
+      <span className="text-[11px] font-bold uppercase tracking-tight">{label}</span>
+      {active ? <Lock size={12} /> : <Unlock size={12} />}
+    </button>
+  );
+}

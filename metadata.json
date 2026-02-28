@@ -1,0 +1,5 @@
+{
+  "name": "Bitruvius Core Engine",
+  "description": "A sophisticated 2.5D anatomical poser with rigid skeleton system, IK/FK solvers, and environmental constraints.",
+  "requestFramePermissions": []
+}
