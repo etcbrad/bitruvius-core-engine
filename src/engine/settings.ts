@@ -21,7 +21,7 @@ const sanitizeJointMask = (raw: unknown, base: JointMask): JointMask => {
     src: typeof mask.src === 'string' ? mask.src : base.src,
     visible: typeof mask.visible === 'boolean' ? mask.visible : base.visible,
     opacity: isFiniteNumber(mask.opacity) ? clamp(mask.opacity, 0, 1) : base.opacity,
-    scale: isFiniteNumber(mask.scale) ? clamp(mask.scale, 0.01, 5) : base.scale,
+    scale: isFiniteNumber(mask.scale) ? clamp(mask.scale, 0.01, 20) : base.scale,
     offsetX: isFiniteNumber(mask.offsetX) ? clamp(mask.offsetX, -5000, 5000) : base.offsetX,
     offsetY: isFiniteNumber(mask.offsetY) ? clamp(mask.offsetY, -5000, 5000) : base.offsetY,
   };
@@ -61,7 +61,7 @@ const sanitizeHeadMask = (raw: unknown, base: HeadMask): HeadMask => {
     src: typeof mask.src === 'string' ? mask.src : base.src,
     visible: typeof mask.visible === 'boolean' ? mask.visible : base.visible,
     opacity: isFiniteNumber(mask.opacity) ? clamp(mask.opacity, 0, 1) : base.opacity,
-    scale: isFiniteNumber(mask.scale) ? clamp(mask.scale, 0.01, 5) : base.scale,
+    scale: isFiniteNumber(mask.scale) ? clamp(mask.scale, 0.01, 20) : base.scale,
   };
 };
 
@@ -92,6 +92,8 @@ export const makeDefaultState = (): SkeletonState => ({
   leadEnabled: true,
   hardStop: false,
   activePins: [],
+  showJoints: true,
+  jointsOverMasks: true,
   viewMode: 'default',
   controlMode: 'Hybrid',
   snappiness: 0.35,
@@ -224,6 +226,8 @@ export const sanitizeState = (rawState: unknown): SkeletonState => {
     leadEnabled: typeof raw.leadEnabled === 'boolean' ? raw.leadEnabled : base.leadEnabled,
     hardStop: typeof raw.hardStop === 'boolean' ? raw.hardStop : base.hardStop,
     activePins,
+    showJoints: typeof raw.showJoints === 'boolean' ? raw.showJoints : base.showJoints,
+    jointsOverMasks: typeof raw.jointsOverMasks === 'boolean' ? raw.jointsOverMasks : base.jointsOverMasks,
     viewMode,
     controlMode,
     snappiness,

@@ -34,6 +34,7 @@ import { applyPoseSnapshotToJoints, capturePoseSnapshot, sampleClipPose } from '
 import { getGhostFrames } from './engine/onionSkin';
 import { makeDefaultState, sanitizeState, sanitizeJoints } from './engine/settings';
 import { INITIAL_JOINTS } from './engine/model';
+import { shouldRunPosePhysics, stepPosePhysics } from './engine/physics';
 
 const LOCAL_STORAGE_KEY = 'bitruvius_state';
 const BUILD_ID = 'joint-masks-drag-2026-02-28';
@@ -131,6 +132,29 @@ export default function App() {
     console.log(`[bitruvius] build=${BUILD_ID}`);
   }, []);
 
+  const activePinsKey = state.activePins.join('|');
+  useEffect(() => {
+    const active = new Set(state.activePins);
+    const next = { ...pinTargetsRef.current };
+    let changed = false;
+
+    for (const id of active) {
+      if (!next[id]) {
+        next[id] = getWorldPosition(id, state.joints, INITIAL_JOINTS, 'preview');
+        changed = true;
+      }
+    }
+
+    for (const id of Object.keys(next)) {
+      if (!active.has(id)) {
+        delete next[id];
+        changed = true;
+      }
+    }
+
+    if (changed) pinTargetsRef.current = next;
+  }, [activePinsKey]);
+
   const historyCtrlRef = useRef(new HistoryController<SkeletonState>({ limit: 120 }));
   const canUndo = historyCtrlRef.current.canUndo();
   const canRedo = historyCtrlRef.current.canRedo();
@@ -141,6 +165,9 @@ export default function App() {
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const draggingIdLiveRef = useRef<string | null>(null);
   const pinWorldRef = useRef<Record<string, Point> | null>(null);
+  const dragTargetRef = useRef<{ id: string; target: Point } | null>(null);
+  const pinTargetsRef = useRef<Record<string, Point>>({});
+  const hingeSignsRef = useRef<Record<string, number>>({});
   const [maskEditArmed, setMaskEditArmed] = useState(false);
   const [maskDragging, setMaskDragging] = useState<null | {
     jointId: string;
@@ -431,6 +458,37 @@ export default function App() {
     [addConsoleLog, setStateWithHistory],
   );
 
+  const copyJointMaskTo = useCallback(
+    (sourceJointId: string, targetJointId: string) => {
+      const sourceMask = state.scene.jointMasks[sourceJointId];
+      if (!sourceMask?.src) {
+        addConsoleLog('error', `No mask found on ${sourceJointId} to copy`);
+        return;
+      }
+
+      setStateWithHistory(`copy_joint_mask:${sourceJointId}->${targetJointId}`, (prev) => ({
+        ...prev,
+        scene: {
+          ...prev.scene,
+          jointMasks: {
+            ...prev.scene.jointMasks,
+            [targetJointId]: {
+              ...prev.scene.jointMasks[targetJointId],
+              src: sourceMask.src,
+              visible: true,
+              opacity: sourceMask.opacity,
+              scale: sourceMask.scale,
+              offsetX: sourceMask.offsetX,
+              offsetY: sourceMask.offsetY,
+            },
+          },
+        },
+      }));
+      addConsoleLog('success', `Mask copied from ${sourceJointId} to ${targetJointId}`);
+    },
+    [addConsoleLog, setStateWithHistory, state.scene.jointMasks],
+  );
+
   const undo = useCallback(() => {
     setTimelinePlaying(false);
     setDraggingId(null);
@@ -664,11 +722,40 @@ export default function App() {
     let last = performance.now();
     const update = () => {
       setState(prev => {
-        const nextJoints = { ...prev.joints };
-        let changed = false;
         const now = performance.now();
         const dt = Math.max(0, (now - last) / 1000);
         last = now;
+
+        if (shouldRunPosePhysics(prev)) {
+          const drag = dragTargetRef.current;
+          const pinTargets = pinTargetsRef.current;
+          const activePinTargets: Record<string, Point> = {};
+          for (const id of prev.activePins) {
+            const t = pinTargets[id];
+            if (t) activePinTargets[id] = t;
+          }
+
+          const result = stepPosePhysics({
+            joints: prev.joints,
+            activePins: prev.activePins,
+            pinTargets: activePinTargets,
+            drag: drag && drag.id in prev.joints ? drag : null,
+            options: {
+              dt,
+              iterations: 16,
+              damping: 0.03,
+              wireCompliance: 0.0015,
+              hardStop: prev.hardStop,
+              autoBend: prev.bendEnabled,
+              hingeSigns: hingeSignsRef.current,
+            },
+          });
+          hingeSignsRef.current = result.hingeSigns;
+          return { ...prev, joints: result.joints };
+        }
+
+        const nextJoints = { ...prev.joints };
+        let changed = false;
 
         // While the user is actively dragging (joint or mask), the rig should
         // track the cursor exactly (no smoothing/lead lag).
@@ -791,6 +878,9 @@ export default function App() {
     setSelectedJointId(id);
     historyCtrlRef.current.beginAction(`drag:${id}`, state);
     draggingIdLiveRef.current = id;
+    if (shouldRunPosePhysics(state)) {
+      dragTargetRef.current = { id, target: getWorldPosition(id, state.joints, INITIAL_JOINTS, 'preview') };
+    }
     pinWorldRef.current = state.activePins.reduce<Record<string, Point>>((acc, pinId) => {
       acc[pinId] = getWorldPosition(pinId, state.joints, INITIAL_JOINTS, 'preview');
       return acc;
@@ -857,6 +947,11 @@ export default function App() {
       const mouseX = (e.clientX - rect.left - centerX) / scale;
       const mouseY = (e.clientY - rect.top - centerY) / scale;
 
+      if (shouldRunPosePhysics(state)) {
+        dragTargetRef.current = { id: draggingId, target: { x: mouseX, y: mouseY } };
+        return;
+      }
+
       const pinWorld = pinWorldRef.current;
       const hasPinnedFeet = Boolean(pinWorld && ('l_ankle' in pinWorld || 'r_ankle' in pinWorld));
       const isBalanceHandle =
@@ -879,7 +974,7 @@ export default function App() {
         setState((prev) => applyDragToState(prev, draggingId, { x: mouseX, y: mouseY }));
       }
     },
-    [draggingId, maskDragging],
+    [draggingId, maskDragging, state.stretchEnabled],
   );
 
   const handleMouseUp = () => {
@@ -890,6 +985,7 @@ export default function App() {
     maskDraggingLiveRef.current = false;
     draggingIdLiveRef.current = null;
     pinWorldRef.current = null;
+    dragTargetRef.current = null;
     setDraggingId(null);
     setState((prev) => {
       const changed = historyCtrlRef.current.commitAction(prev);
@@ -987,6 +1083,8 @@ export default function App() {
   }, [setStateWithHistory, timelineFrame]);
 
   const resetSkeleton = () => {
+    pinTargetsRef.current = {};
+    hingeSignsRef.current = {};
     setStateWithHistory('reset_engine', (prev) => ({
       ...prev,
       joints: sanitizeJoints(null),
@@ -994,6 +1092,16 @@ export default function App() {
   };
 
   const togglePin = (id: string) => {
+    if (state.activePins.includes(id)) {
+      const next = { ...pinTargetsRef.current };
+      delete next[id];
+      pinTargetsRef.current = next;
+    } else {
+      pinTargetsRef.current = {
+        ...pinTargetsRef.current,
+        [id]: getWorldPosition(id, state.joints, INITIAL_JOINTS, 'preview'),
+      };
+    }
     setStateWithHistory('toggle_pin', (prev) => ({
       ...prev,
       activePins: prev.activePins.includes(id)
@@ -1180,6 +1288,54 @@ export default function App() {
     Object.values(state.scene.jointMasks).some((m) => Boolean(m?.src));
 
   const showEditorGrid = Boolean(gridRingsBg) || hasSceneImages;
+
+  const jointMasksLayer = (() => {
+    if (!canvasSize.width || !canvasSize.height) return null;
+    const pxPerUnit = 20;
+    const centerX = canvasSize.width / 2;
+    const centerY = canvasSize.height / 2;
+    const headPos = getWorldPosition('head', state.joints, INITIAL_JOINTS);
+    const craniumPos = getWorldPosition('cranium', state.joints, INITIAL_JOINTS);
+    const neckBasePos = getWorldPosition('neck_base', state.joints, INITIAL_JOINTS);
+    const headLenUnits = Math.hypot(headPos.x - craniumPos.x, headPos.y - craniumPos.y) * 2;
+    const headLenPx = Math.max(1, headLenUnits * pxPerUnit);
+    const neckSpanUnits = Math.hypot(headPos.x - neckBasePos.x, headPos.y - neckBasePos.y);
+    const neckSpanPx = Math.max(1, neckSpanUnits * pxPerUnit);
+
+    return Object.entries(state.scene.jointMasks).map(([jointId, mask]) => {
+      if (!mask?.src || !mask.visible) return null;
+      if (!(jointId in state.joints)) return null;
+
+      const jointPos = getWorldPosition(jointId, state.joints, INITIAL_JOINTS);
+      const jointX = jointPos.x * pxPerUnit + centerX;
+      const jointY = jointPos.y * pxPerUnit + centerY;
+      if (isNaN(jointX) || isNaN(jointY)) return null;
+
+      const requestedSize = headLenPx * Math.max(0.01, mask.scale);
+      const size = requestedSize;
+      const x = jointX - size / 2 + (mask.offsetX || 0);
+      const y = jointY - size / 2 + (mask.offsetY || 0);
+
+      return (
+        <image
+          key={`joint-mask:${jointId}`}
+          href={mask.src}
+          x={x}
+          y={y}
+          width={size}
+          height={size}
+          opacity={mask.opacity}
+          onMouseDown={handleMaskMouseDown(jointId)}
+          style={{
+            pointerEvents: maskEditArmed ? 'auto' : 'none',
+            cursor: maskEditArmed ? 'grab' : 'default',
+          }}
+        />
+      );
+    });
+  })();
+
+  const jointsLayer = state.showJoints ? Object.keys(state.joints).map(renderJoint) : null;
 
   return (
     <div
@@ -1578,31 +1734,54 @@ export default function App() {
               </div>
             </section>
 
-            <section>
-              <div className="flex items-center gap-2 mb-4 text-[#666]">
-                <Layers size={14} />
-                <h2 className="text-[10px] font-bold uppercase tracking-widest">Scene</h2>
-              </div>
+	            <section>
+	              <div className="flex items-center gap-2 mb-4 text-[#666]">
+	                <Layers size={14} />
+	                <h2 className="text-[10px] font-bold uppercase tracking-widest">Scene</h2>
+	              </div>
 
-              {/* Guides */}
-              <div className="mb-4">
-                <label className="flex items-center justify-between gap-3 text-[10px]">
-                  <span className="font-bold uppercase tracking-widest text-[#666]">Vitruvian Guides</span>
-                  <input
-                    type="checkbox"
-                    checked={gridRingsEnabled}
-                    disabled={!gridRingsBgData}
-                    onChange={(e) => setGridRingsEnabled(e.target.checked)}
-                    className="rounded disabled:opacity-50"
-                    title={gridRingsBgData ? 'Toggle grid + rings overlay' : 'Guides data missing (grid_rings_background.json)'}
+	              {/* Guides */}
+	              <div className="mb-4">
+	                <label className="flex items-center justify-between gap-3 text-[10px]">
+	                  <span className="font-bold uppercase tracking-widest text-[#666]">Vitruvian Guides</span>
+	                  <input
+	                    type="checkbox"
+	                    checked={gridRingsEnabled}
+	                    disabled={!gridRingsBgData}
+	                    onChange={(e) => setGridRingsEnabled(e.target.checked)}
+	                    className="rounded disabled:opacity-50"
+	                    title={gridRingsBgData ? 'Toggle grid + rings overlay' : 'Guides data missing (grid_rings_background.json)'}
+	                  />
+	                </label>
+	              </div>
+
+                <div className="space-y-2 mb-4">
+                  <Toggle
+                    label="Joints"
+                    active={state.showJoints}
+                    onClick={() =>
+                      setStateWithHistory('toggle_show_joints', (prev) => ({
+                        ...prev,
+                        showJoints: !prev.showJoints,
+                      }))
+                    }
                   />
-                </label>
-              </div>
-              
-              {/* Background Layer */}
-              <div className="mb-4">
-                <div className="flex items-center justify-between mb-2">
-                  <span className="text-[10px] font-bold uppercase tracking-widest text-[#666]">Background</span>
+                  <Toggle
+                    label="Joints Above Masks"
+                    active={state.jointsOverMasks}
+                    onClick={() =>
+                      setStateWithHistory('toggle_joints_over_masks', (prev) => ({
+                        ...prev,
+                        jointsOverMasks: !prev.jointsOverMasks,
+                      }))
+                    }
+                  />
+                </div>
+	              
+	              {/* Background Layer */}
+	              <div className="mb-4">
+	                <div className="flex items-center justify-between mb-2">
+	                  <span className="text-[10px] font-bold uppercase tracking-widest text-[#666]">Background</span>
                   <button
                     onClick={() => document.getElementById('bg-upload')?.click()}
                     className="px-2 py-1 bg-[#222] hover:bg-[#333] rounded text-[10px] transition-colors"
@@ -2012,6 +2191,32 @@ export default function App() {
                               {state.joints[id].label || id}
                             </option>
                           ))}
+                        </select>
+                      </div>
+
+                      <div className="flex gap-2">
+                        <select
+                          value=""
+                          onChange={(e) => {
+                            const targetJointId = e.target.value;
+                            if (targetJointId) {
+                              copyJointMaskTo(maskJointId, targetJointId);
+                              e.target.value = '';
+                            }
+                          }}
+                          className="flex-1 px-2 py-1 bg-[#222] rounded text-[10px]"
+                          disabled={!mask.src}
+                        >
+                          <option value="" disabled>
+                            Copy graphic to: {mask.src ? 'select joint' : 'upload first'}
+                          </option>
+                          {Object.keys(state.joints)
+                            .filter(id => id !== maskJointId)
+                            .map((id) => (
+                              <option key={id} value={id}>
+                                {state.joints[id].label || id}
+                              </option>
+                            ))}
                         </select>
                       </div>
 
@@ -2531,61 +2736,28 @@ export default function App() {
                 />
               );
             })}
-            
-	            {/* Joint Masks */}
-	            {(() => {
-	              if (!canvasSize.width || !canvasSize.height) return null;
-	              const pxPerUnit = 20;
-	              const centerX = canvasSize.width / 2;
-	              const centerY = canvasSize.height / 2;
-	              const headPos = getWorldPosition('head', state.joints, INITIAL_JOINTS);
-	              const craniumPos = getWorldPosition('cranium', state.joints, INITIAL_JOINTS);
-	              const neckBasePos = getWorldPosition('neck_base', state.joints, INITIAL_JOINTS);
-	              const headLenUnits = Math.hypot(headPos.x - craniumPos.x, headPos.y - craniumPos.y) * 2;
-	              const headLenPx = Math.max(1, headLenUnits * pxPerUnit);
-	              const neckSpanUnits = Math.hypot(headPos.x - neckBasePos.x, headPos.y - neckBasePos.y);
-	              const neckSpanPx = Math.max(1, neckSpanUnits * pxPerUnit);
+	            
+	            {!state.jointsOverMasks && (
+	              <>
+	                {/* Joints */}
+	                {jointsLayer}
+	                {/* Joint Masks */}
+	                {jointMasksLayer}
+	              </>
+	            )}
 
-	              return Object.entries(state.scene.jointMasks).map(([jointId, mask]) => {
-	                if (!mask?.src || !mask.visible) return null;
-	                if (!(jointId in state.joints)) return null;
-
-	                const jointPos = getWorldPosition(jointId, state.joints, INITIAL_JOINTS);
-	                const jointX = jointPos.x * pxPerUnit + centerX;
-	                const jointY = jointPos.y * pxPerUnit + centerY;
-	                if (isNaN(jointX) || isNaN(jointY)) return null;
-
-	                const requestedSize = headLenPx * Math.max(0.01, mask.scale);
-	                const autoMaxSize = neckSpanPx;
-	                const size = requestedSize > autoMaxSize * 1.05 ? autoMaxSize : requestedSize;
-	                const x = jointX - size / 2 + (mask.offsetX || 0);
-	                const y = jointY - size / 2 + (mask.offsetY || 0);
-
-	                return (
-	                  <image
-                    key={`joint-mask:${jointId}`}
-                    href={mask.src}
-                    x={x}
-                    y={y}
-                    width={size}
-                    height={size}
-                    opacity={mask.opacity}
-                    onMouseDown={handleMaskMouseDown(jointId)}
-                    style={{
-                      pointerEvents: maskEditArmed ? 'auto' : 'none',
-                      cursor: maskEditArmed ? 'grab' : 'default',
-                    }}
-                  />
-                );
-              });
-            })()}
-            
-            {/* Joints */}
-            {Object.keys(state.joints).map(renderJoint)}
-            
-            {/* Foreground Reference Layer */}
-	            {state.scene.foreground.src && state.scene.foreground.visible && (
-	              <image
+	            {state.jointsOverMasks && (
+	              <>
+	                {/* Joint Masks */}
+	                {jointMasksLayer}
+	                {/* Joints */}
+	                {jointsLayer}
+	              </>
+	            )}
+	            
+	            {/* Foreground Reference Layer */}
+		            {state.scene.foreground.src && state.scene.foreground.visible && (
+		              <image
 	                href={state.scene.foreground.src}
 	                x={state.scene.foreground.x}
 	                y={state.scene.foreground.y}

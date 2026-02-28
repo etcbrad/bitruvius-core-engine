@@ -100,6 +100,8 @@ export interface SkeletonState {
   leadEnabled: boolean;
   hardStop: boolean;
   activePins: string[];
+  showJoints: boolean;
+  jointsOverMasks: boolean;
   viewMode: ViewModeId;
   controlMode: ControlMode;
   snappiness: number;
