@@ -23,3 +23,6 @@ TODO
 
 2026-02-28
 - Added “balance IK” path for IK/Hybrid drags: when ankle pins are active and you drag head/core joints, the rig translates from `sacrum` while re-solving pinned legs so pinned ankle world positions stay fixed (with reach clamping + optional spine FABRIK when clamped).
+
+2026-02-28
+- Implemented XPBD/PBD-style “Pose Physics” mode driven by the existing `Elasticity (S)` toggle: hard pin constraints + rigid hierarchy bones + soft wire constraints + optional hinge limits (Hard Stop) and hinge bias (Auto-Bend), with cursor-follow dragging and planted feet via pins.
