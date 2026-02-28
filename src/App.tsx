@@ -37,8 +37,80 @@ import { INITIAL_JOINTS } from './engine/model';
 import { shouldRunPosePhysics, stepPosePhysics } from './engine/physics';
 
 const LOCAL_STORAGE_KEY = 'bitruvius_state';
+const IMAGE_CACHE_KEY = 'bitruvius_image_cache';
 const BUILD_ID = 'joint-masks-drag-2026-02-28';
 const DND_WIDGET_MIME = 'text/bitruvius-widget';
+
+// Image cache utilities for persisting uploads
+const convertBlobUrlToBase64 = async (blobUrl: string): Promise<string | null> => {
+  try {
+    const response = await fetch(blobUrl);
+    const blob = await response.blob();
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result as string);
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+  } catch (error) {
+    console.warn('Failed to convert blob URL to base64:', error);
+    return null;
+  }
+};
+
+const cacheImageFromUrl = async (url: string, cacheKey: string): Promise<void> => {
+  if (!url || !url.startsWith('blob:')) return;
+  
+  try {
+    const base64 = await convertBlobUrlToBase64(url);
+    if (base64) {
+      const cache = JSON.parse(localStorage.getItem(IMAGE_CACHE_KEY) || '{}');
+      cache[cacheKey] = base64;
+      localStorage.setItem(IMAGE_CACHE_KEY, JSON.stringify(cache));
+    }
+  } catch (error) {
+    console.warn('Failed to cache image:', error);
+  }
+};
+
+const restoreImageFromCache = (cacheKey: string): string | null => {
+  try {
+    const cache = JSON.parse(localStorage.getItem(IMAGE_CACHE_KEY) || '{}');
+    const base64 = cache[cacheKey];
+    return base64 || null;
+  } catch (error) {
+    console.warn('Failed to restore image from cache:', error);
+    return null;
+  }
+};
+
+// Clean up old cache entries to prevent localStorage bloat
+const cleanupImageCache = () => {
+  try {
+    const cache = JSON.parse(localStorage.getItem(IMAGE_CACHE_KEY) || '{}');
+    const currentCacheKeys = new Set([
+      'background',
+      'foreground', 
+      'head_mask',
+      ...Object.keys(INITIAL_JOINTS).map(id => `joint_mask_${id}`)
+    ]);
+    
+    // Remove entries that are no longer needed
+    let hasChanges = false;
+    for (const key of Object.keys(cache)) {
+      if (!currentCacheKeys.has(key)) {
+        delete cache[key];
+        hasChanges = true;
+      }
+    }
+    
+    if (hasChanges) {
+      localStorage.setItem(IMAGE_CACHE_KEY, JSON.stringify(cache));
+    }
+  } catch (error) {
+    console.warn('Failed to cleanup image cache:', error);
+  }
+};
 
 type WidgetKind = 'joint_masks' | 'console';
 
@@ -122,7 +194,46 @@ export default function App() {
     if (saved) {
       const parsed = deserializeEngineState(saved);
       if (parsed.ok) {
-        return sanitizeState(parsed.rawState);
+        const sanitizedState = sanitizeState(parsed.rawState);
+        
+        // Restore cached images
+        const restoredState = { ...sanitizedState };
+        
+        // Restore background images
+        if (restoredState.scene.background.src) {
+          const cachedBg = restoreImageFromCache('background');
+          if (cachedBg) {
+            restoredState.scene.background.src = cachedBg;
+          }
+        }
+        
+        if (restoredState.scene.foreground.src) {
+          const cachedFg = restoreImageFromCache('foreground');
+          if (cachedFg) {
+            restoredState.scene.foreground.src = cachedFg;
+          }
+        }
+        
+        // Restore head mask
+        if (restoredState.scene.headMask.src) {
+          const cachedHeadMask = restoreImageFromCache('head_mask');
+          if (cachedHeadMask) {
+            restoredState.scene.headMask.src = cachedHeadMask;
+          }
+        }
+        
+        // Restore joint masks
+        for (const jointId of Object.keys(restoredState.scene.jointMasks)) {
+          const mask = restoredState.scene.jointMasks[jointId];
+          if (mask.src) {
+            const cachedMask = restoreImageFromCache(`joint_mask_${jointId}`);
+            if (cachedMask) {
+              mask.src = cachedMask;
+            }
+          }
+        }
+        
+        return restoredState;
       }
     }
     return makeDefaultState();
@@ -130,6 +241,7 @@ export default function App() {
 
   useEffect(() => {
     console.log(`[bitruvius] build=${BUILD_ID}`);
+    cleanupImageCache(); // Clean up old cache entries
   }, []);
 
   const activePinsKey = state.activePins.join('|');
@@ -154,6 +266,12 @@ export default function App() {
 
     if (changed) pinTargetsRef.current = next;
   }, [activePinsKey]);
+
+  useEffect(() => {
+    if (state.stretchEnabled) return;
+    dragTargetRef.current = null;
+    hingeSignsRef.current = {};
+  }, [state.stretchEnabled]);
 
   const historyCtrlRef = useRef(new HistoryController<SkeletonState>({ limit: 120 }));
   const canUndo = historyCtrlRef.current.canUndo();
@@ -411,6 +529,10 @@ export default function App() {
             },
           },
         }));
+        
+        // Cache the image for persistence
+        await cacheImageFromUrl(url, 'head_mask');
+        
         addConsoleLog('success', `Mask uploaded: ${file.name}`);
       } catch (err) {
         const message = err instanceof Error ? err.message : 'Unknown error';
@@ -448,6 +570,10 @@ export default function App() {
             },
           },
         }));
+        
+        // Cache the image for persistence
+        await cacheImageFromUrl(url, `joint_mask_${jointId}`);
+        
         addConsoleLog('success', `Mask uploaded for ${jointId}: ${file.name}`);
       } catch (err) {
         const message = err instanceof Error ? err.message : 'Unknown error';
@@ -484,10 +610,22 @@ export default function App() {
           },
         },
       }));
+      
+      // Cache the copied mask for persistence
+      cacheImageFromUrl(sourceMask.src, `joint_mask_${targetJointId}`);
+      
       addConsoleLog('success', `Mask copied from ${sourceJointId} to ${targetJointId}`);
     },
     [addConsoleLog, setStateWithHistory, state.scene.jointMasks],
   );
+
+  const handleCopyMaskChange = useCallback((e: React.ChangeEvent<HTMLSelectElement>) => {
+    const targetJointId = e.target.value;
+    if (targetJointId) {
+      copyJointMaskTo(maskJointId, targetJointId);
+      e.target.value = '';
+    }
+  }, [copyJointMaskTo, maskJointId]);
 
   const undo = useCallback(() => {
     setTimelinePlaying(false);
@@ -726,7 +864,10 @@ export default function App() {
         const dt = Math.max(0, (now - last) / 1000);
         last = now;
 
-        if (shouldRunPosePhysics(prev)) {
+        const drag = dragTargetRef.current;
+        const physicsActive = shouldRunPosePhysics(prev) && (Boolean(drag) || prev.activePins.length > 0);
+
+        if (physicsActive) {
           const drag = dragTargetRef.current;
           const pinTargets = pinTargetsRef.current;
           const activePinTargets: Record<string, Point> = {};
@@ -1804,6 +1945,9 @@ export default function App() {
                           background: { ...prev.scene.background, src: url, visible: true }
                         }
                       }));
+                      
+                      // Cache the image for persistence
+                      await cacheImageFromUrl(url, 'background');
                     }}
                   />
                 </div>
@@ -1976,6 +2120,9 @@ export default function App() {
                           foreground: { ...prev.scene.foreground, src: url, visible: true }
                         }
                       }));
+                      
+                      // Cache the image for persistence
+                      await cacheImageFromUrl(url, 'foreground');
                     }}
                   />
                 </div>
@@ -2194,16 +2341,16 @@ export default function App() {
                         </select>
                       </div>
 
+                      {mask.src && (
+                        <div className="text-[9px] text-[#666] italic">
+                          💡 Use the dropdown below to copy this mask to other joints with the same position relative to the bone
+                        </div>
+                      )}
+
                       <div className="flex gap-2">
                         <select
                           value=""
-                          onChange={(e) => {
-                            const targetJointId = e.target.value;
-                            if (targetJointId) {
-                              copyJointMaskTo(maskJointId, targetJointId);
-                              e.target.value = '';
-                            }
-                          }}
+                          onChange={handleCopyMaskChange}
                           className="flex-1 px-2 py-1 bg-[#222] rounded text-[10px]"
                           disabled={!mask.src}
                         >
